@@ -90,10 +90,10 @@ final class YadeaAccountTests: XCTestCase {
     }
 
     func testVehicleParsingRequiresCompleteBindingAndNormalizesOnlyMAC() throws {
-        let response: [String: Any] = ["data": [["bikeId": "42", "vin": "fixture-vin", "mac": "a1b2c3d4e5f6", "modelName": "Q17 Pro Y"]]]
+        let response: [String: Any] = ["data": [["bikeId": "42", "vin": "fixture-vin", "mac": "a1b2c3d4e5f6", "modelName": "Example Vehicle"]]]
         let vehicles = try YadeaGateway.vehicles(from: response)
         XCTAssertEqual(vehicles, [YadeaBoundVehicle(id: "fixture-vin", bikeID: 42,
-            vin: "fixture-vin", macAddress: vehicleMAC, name: "Q17 Pro Y")])
+            vin: "fixture-vin", macAddress: vehicleMAC, name: "Example Vehicle")])
         XCTAssertThrowsError(try YadeaGateway.vehicles(from: ["data": [["bikeId": 42, "vin": "fixture-vin"]]]))
         XCTAssertThrowsError(try YadeaGateway.normalizedMAC("prefix A1:B2:C3:D4:E5:F6"))
         XCTAssertThrowsError(try YadeaGateway.normalizedMAC("00:00:00:00:00:00"))
