@@ -11,6 +11,7 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var deviceNamePrefix = "YD"
     @Published var minimumRSSI = -60
     @Published var lastError: String?
+    @Published var operationNotice: OperationNotice?
     @Published private(set) var authenticationStatus = "尚未认证"
 
     let isDemoMode: Bool
@@ -44,6 +45,10 @@ final class BLEManager: NSObject, ObservableObject {
     private var stageTimeoutWorkItem: DispatchWorkItem?
     private var connectionStage = "未连接"
     private let lastDiagnosticKey = "yd-last-failed-diagnostic-v1"
+    private var operationFeedback = OperationFeedback()
+    private var operationFeedbackTimeout: DispatchWorkItem?
+    private var periodicStatusSampler = PeriodicStatusLogSampler()
+    private var lastShortReportedState: Int?
 
     var diagnosticReport: String {
         let current = currentDiagnosticReport
@@ -66,7 +71,7 @@ final class BLEManager: NSObject, ObservableObject {
             return "\(formatter.string(from: entry.timestamp)) [\(entry.direction.rawValue)] \(entry.message)\(payload)"
         }
         return ([
-            "YD E-Bike Helper / authentication-diagnostics-3",
+            "YD E-Bike Helper / authentication-diagnostics-4",
             "版本：\(version) (\(build))",
             "源码：\(revision)",
             "系统：\(ProcessInfo.processInfo.operatingSystemVersionString)",
@@ -83,6 +88,7 @@ final class BLEManager: NSObject, ObservableObject {
         let label: String
         let completesAuthentication: Bool
         let isSensitive: Bool
+        let expectedStatusValue: Int?
     }
 
     private var writeQueue: [PendingWrite] = []
@@ -207,6 +213,7 @@ final class BLEManager: NSObject, ObservableObject {
         scanStopWorkItem?.cancel()
         isScanning = true
         lastError = nil
+        operationNotice = nil
         appendLog(.system, "开始扫描 BLE 设备（5 秒）")
         central.scanForPeripherals(
             withServices: nil,
@@ -290,6 +297,7 @@ final class BLEManager: NSObject, ObservableObject {
         connectionFailed = false
         disconnectRequested = false
         lastError = nil
+        operationNotice = nil
         authenticationStatus = "等待建立蓝牙连接"
         activeAuthenticationWriteMode = writeMode
         activePeripheral = peripheral
@@ -329,11 +337,11 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func unlockPower() {
-        sendCommand(YDEbikeProtocol.debugPacket(), label: "解除动力锁定")
+        sendCommand(YDEbikeProtocol.debugPacket(), label: "解除动力锁定", expectedStatusValue: 1)
     }
 
     func restorePowerLock() {
-        sendCommand(YDEbikeProtocol.restorePacket(), label: "恢复动力锁定")
+        sendCommand(YDEbikeProtocol.restorePacket(), label: "恢复动力锁定", expectedStatusValue: 0)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.sendCommand(YDEbikeProtocol.volumePacket(level: 4), label: "恢复后音量 4")
         }
@@ -353,10 +361,11 @@ final class BLEManager: NSObject, ObservableObject {
 
     func clearLogs() {
         logs.removeAll()
+        _ = periodicStatusSampler.flush()
         UserDefaults.standard.removeObject(forKey: lastDiagnosticKey)
     }
 
-    private func sendCommand(_ data: Data, label: String) {
+    private func sendCommand(_ data: Data, label: String, expectedStatusValue: Int? = nil) {
         if isDemoMode {
             appendLog(.sent, label, data: data)
             appendLog(.received, "车辆响应", data: Data([0x5A, 0x96, 0x01]))
@@ -371,7 +380,7 @@ final class BLEManager: NSObject, ObservableObject {
             reportError("设备尚未完成认证，不能发送指令。")
             return
         }
-        enqueueWrite(data, to: characteristic, label: label)
+        enqueueWrite(data, to: characteristic, label: label, expectedStatusValue: expectedStatusValue)
     }
 
     private func beginAuthenticationIfPossible() {
@@ -660,7 +669,8 @@ final class BLEManager: NSObject, ObservableObject {
         to characteristic: CBCharacteristic,
         label: String,
         completesAuthentication: Bool = false,
-        isSensitive: Bool = false
+        isSensitive: Bool = false,
+        expectedStatusValue: Int? = nil
     ) {
         writeQueue.append(
             PendingWrite(
@@ -668,7 +678,8 @@ final class BLEManager: NSObject, ObservableObject {
                 characteristic: characteristic,
                 label: label,
                 completesAuthentication: completesAuthentication,
-                isSensitive: isSensitive
+                isSensitive: isSensitive,
+                expectedStatusValue: expectedStatusValue
             )
         )
         drainWriteQueue()
@@ -721,6 +732,11 @@ final class BLEManager: NSObject, ObservableObject {
         }
         activeWrite = next
         activeWriteRequiresResponse = usesResponse
+        if let expectedValue = next.expectedStatusValue, usesResponse {
+            operationNotice = nil
+            operationFeedback.begin(label: next.label, expectedValue: expectedValue)
+            scheduleOperationFeedbackTimeout()
+        }
         setStage(next.completesAuthentication ? "写入认证应答" : "写入\(next.label)", timeout: 8)
         appendLog(.system, "\(next.label)使用 \(usesResponse ? "Write Request" : "Write Without Response")")
         appendLog(
@@ -745,11 +761,24 @@ final class BLEManager: NSObject, ObservableObject {
         if let error {
             let message = "\(write.label)写入失败：\(errorDescription(error))"
             if write.completesAuthentication { failConnection(message) }
-            else { reportError(message) }
+            else {
+                if write.expectedStatusValue != nil {
+                    operationFeedback.reset()
+                    operationFeedbackTimeout?.cancel()
+                }
+                reportError(message)
+            }
         } else {
+            let detail = write.completesAuthentication
+                ? "不等于车辆业务认证成功" : "尚不代表车辆执行结果已确认"
             appendLog(.system, requiresResponse
-                ? "\(write.label)已获得 GATT 写确认；不等于车辆业务认证成功"
+                ? "\(write.label)已获得 GATT 写确认；\(detail)"
                 : "\(write.label)已提交蓝牙发送队列；Write Without Response 没有车端写确认")
+            if write.expectedStatusValue != nil, requiresResponse,
+                let notice = operationFeedback.recordWriteConfirmation()
+            {
+                showOperationNotice(notice)
+            }
             if write.completesAuthentication, let peripheral = activePeripheral {
                 if authenticationUsesToken {
                     v2WriteConfirmed = true
@@ -764,7 +793,42 @@ final class BLEManager: NSObject, ObservableObject {
                 }
             }
         }
+        if !write.completesAuthentication, writeQueue.isEmpty,
+            authenticationCompleted, activeDevice?.phase == .ready
+        {
+            setStage("已连接，等待操作")
+        }
         drainWriteQueue()
+    }
+
+    private func scheduleOperationFeedbackTimeout() {
+        operationFeedbackTimeout?.cancel()
+        guard let operationID = operationFeedback.pendingID else { return }
+        let attemptID = connectionAttemptID
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.connectionAttemptID == attemptID,
+                self.activePeripheral != nil, !self.disconnectRequested, !self.connectionFailed
+            else { return }
+            if let notice = self.operationFeedback.timeout(id: operationID) {
+                self.showOperationNotice(notice)
+            }
+        }
+        operationFeedbackTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: work)
+    }
+
+    private func showOperationNotice(_ notice: OperationNotice) {
+        operationFeedbackTimeout?.cancel()
+        operationFeedbackTimeout = nil
+        operationNotice = notice
+        appendLog(.system, notice.message)
+    }
+
+    private func flushPeriodicStatusSummary() {
+        let suppressed = periodicStatusSampler.flush()
+        if suppressed > 0 {
+            appendLog(.system, "已合并 \(suppressed) 条周期车辆状态通知；未重复记录原始帧")
+        }
     }
 
     private func subscribeCommandNotifications(peripheral: CBPeripheral) {
@@ -799,6 +863,11 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private func resetProtocolState() {
+        operationFeedbackTimeout?.cancel()
+        operationFeedbackTimeout = nil
+        operationFeedback.reset()
+        lastShortReportedState = nil
+        flushPeriodicStatusSummary()
         tokenFetchTask?.cancel()
         tokenFetchTask = nil
         stageTimeoutWorkItem?.cancel()
@@ -1100,12 +1169,14 @@ extension BLEManager: CBCentralManagerDelegate {
         let disconnectedDuringAuthentication = authenticationStarted && !authenticationCompleted
         let unexpected = !disconnectRequested && !connectionFailed
         updatePhase(connectionFailed || unexpected ? .failed : .discovered, for: peripheral.identifier)
-        appendLog(
-            error == nil ? .system : .error,
-            error == nil
-                ? "已断开 \(displayName(for: peripheral))"
-                : "连接中断：\(errorDescription(error!))"
-        )
+        flushPeriodicStatusSummary()
+        if !unexpected {
+            appendLog(
+                error == nil ? .system : .error,
+                error == nil ? "已断开 \(displayName(for: peripheral))"
+                    : "断开回调：\(errorDescription(error!))"
+            )
+        }
         if disconnectedDuringAuthentication {
             appendLog(
                 .error,
@@ -1220,12 +1291,20 @@ extension BLEManager: CBPeripheralDelegate {
             && (try? YDEbikeProtocol.authenticationProfile(challenge: data).flow) == .tokenV2
         let hideData = isV2Challenge
             || (uuid == YDEbikeProtocol.authenticationNotifyCharacteristic && authenticationUsesToken)
-        appendLog(
-            .received,
-            hideData ? "\(characteristic.uuid.uuidString)，\(data.count) 字节（V2 认证内容已隐藏）"
-                : characteristic.uuid.uuidString,
-            data: hideData ? nil : data
-        )
+        let statusType = uuid == YDEbikeProtocol.commandNotifyCharacteristic
+            ? YDEbikeProtocol.vehicleStatusFrameType(from: data) : nil
+        let logDecision = periodicStatusSampler.accept(frameType: statusType, now: Date())
+        if logDecision.shouldLog {
+            if logDecision.suppressed > 0 {
+                appendLog(.system, "过去 15 秒合并 \(logDecision.suppressed) 条同类周期状态通知")
+            }
+            appendLog(
+                .received,
+                hideData ? "\(characteristic.uuid.uuidString)，\(data.count) 字节（V2 认证内容已隐藏）"
+                    : characteristic.uuid.uuidString,
+                data: hideData ? nil : data
+            )
+        }
         switch characteristic.uuid.uuidString.uppercased() {
         case YDEbikeProtocol.authenticationReadWriteCharacteristic:
             if authenticationStarted && authenticationReadScheduled && !authenticationCompleted {
@@ -1238,11 +1317,14 @@ extension BLEManager: CBPeripheralDelegate {
                 appendLog(.system, "已收到认证通知；当前旧版流程不把该通知自动判为认证成功")
             }
         case YDEbikeProtocol.commandNotifyCharacteristic:
-            if let code = YDEbikeProtocol.commandResponseCode(from: data) {
-                appendLog(
-                    code == 1 ? .system : .error,
-                    code == 1 ? "设备返回：操作成功" : "设备返回：操作失败（状态 \(code)）"
-                )
+            if let state = YDEbikeProtocol.shortReportedState(from: data) {
+                if lastShortReportedState != state {
+                    appendLog(.system, "车辆短状态字段更新：\(state)（状态上报，不是通用命令结果）")
+                    lastShortReportedState = state
+                }
+                if let notice = operationFeedback.recordState(state) {
+                    showOperationNotice(notice)
+                }
             }
         default:
             break

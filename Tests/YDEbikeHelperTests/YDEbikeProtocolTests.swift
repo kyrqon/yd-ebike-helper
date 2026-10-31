@@ -211,12 +211,13 @@ final class YDEbikeProtocolTests: XCTestCase {
         XCTAssertEqual([UInt8](YDEbikeProtocol.volumePacket(level: 7))[52], 0x7F)
     }
 
-    func testCommandResponseParser() {
-        var response = Data(repeating: 0, count: 40)
-        response[2] = 0x2A
-        response[39] = 0x08
-        XCTAssertEqual(YDEbikeProtocol.commandResponseCode(from: response), 1)
-        XCTAssertNil(YDEbikeProtocol.commandResponseCode(from: Data([0x59, 0x44])))
+    func testShortStatusParserRequiresACompleteValidFrame() throws {
+        let reported = try YDEbikeProtocol.parseHex("59 44 29 08 55 FD FF FF FF FF FF FF 7D 4B 4A")
+        XCTAssertEqual(YDEbikeProtocol.shortReportedState(from: reported), 1)
+        XCTAssertNil(YDEbikeProtocol.shortReportedState(from: Data(reported.dropLast())))
+        var damaged = reported
+        damaged[12] ^= 1
+        XCTAssertNil(YDEbikeProtocol.shortReportedState(from: damaged))
     }
 
     func testHexParser() throws {

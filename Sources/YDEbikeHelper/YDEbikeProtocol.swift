@@ -227,12 +227,24 @@ enum YDEbikeProtocol {
         return checksummed(packet)
     }
 
-    static func commandResponseCode(from data: Data) -> Int? {
+    /// Complete, checksum-valid status frames. These are telemetry, not command ACKs.
+    static func vehicleStatusFrameType(from data: Data) -> UInt8? {
         let bytes = [UInt8](data)
-        guard bytes.count >= 40, bytes[2] == 0x2A else {
-            return nil
-        }
-        return Int((bytes[39] >> 3) & 0x03)
+        guard bytes.count >= 7, bytes[0] == 0x59, bytes[1] == 0x44,
+            [UInt8(0x29), 0x2A, 0x2B].contains(bytes[2]),
+            bytes.count == Int(bytes[3]) + 7,
+            bytes[bytes.count - 2] == 0x4B, bytes.last == 0x4A
+        else { return nil }
+        let checksumIndex = bytes.count - 3
+        let sum = bytes[2..<checksumIndex].reduce(UInt8(0)) { $0 &+ $1 }
+        return sum == bytes[checksumIndex] ? bytes[2] : nil
+    }
+
+    /// Observed short status field, not a per-command execution result.
+    static func shortReportedState(from data: Data) -> Int? {
+        guard vehicleStatusFrameType(from: data) == 0x29, data.count >= 9 else { return nil }
+        let raw = Int([UInt8](data)[5] & 0x03)
+        return raw == 3 ? nil : raw
     }
 
     static func parseHex(_ input: String) throws -> Data {
