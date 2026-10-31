@@ -4,6 +4,7 @@ import Foundation
 enum YadeaCryptoError: LocalizedError, Equatable {
     case invalidKeyLength
     case invalidCiphertextLength
+    case invalidPadding
     case invalidHandshakeLength
     case operationFailed(Int32)
 
@@ -13,6 +14,8 @@ enum YadeaCryptoError: LocalizedError, Equatable {
             return "AES 密钥长度无效。"
         case .invalidCiphertextLength:
             return "加密响应长度无效，无法解密。"
+        case .invalidPadding:
+            return "加密响应的补位无效，已拒绝解密结果。"
         case .invalidHandshakeLength:
             return "V2 握手需要 16 字节 RandKey 和按 16 字节对齐的明文。"
         case .operationFailed(let status):
@@ -31,8 +34,14 @@ enum YadeaCrypto {
         guard !data.isEmpty, data.count.isMultiple(of: kCCBlockSizeAES128) else {
             throw YadeaCryptoError.invalidCiphertextLength
         }
-        return try crypt(data, key: key, operation: CCOperation(kCCDecrypt),
-                         options: CCOptions(kCCOptionECBMode | kCCOptionPKCS7Padding))
+        let plaintext = try crypt(data, key: key, operation: CCOperation(kCCDecrypt),
+                                  options: CCOptions(kCCOptionECBMode))
+        let padding = Int(plaintext.last ?? 0)
+        guard (1...kCCBlockSizeAES128).contains(padding),
+            padding <= plaintext.count,
+            plaintext.suffix(padding).allSatisfy({ $0 == UInt8(padding) })
+        else { throw YadeaCryptoError.invalidPadding }
+        return Data(plaintext.dropLast(padding))
     }
 
     static func encryptHandshake(_ plaintext: Data, randomKey: Data) throws -> Data {

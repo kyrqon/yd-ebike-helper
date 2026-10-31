@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import LocalAuthentication
 import Security
 
 struct YadeaBoundVehicle: Identifiable, Equatable {
@@ -89,7 +90,9 @@ struct YadeaKeychainSessionStore: YadeaSessionStore {
         var search = query
         search[kSecReturnData as String] = true
         search[kSecMatchLimit as String] = kSecMatchLimitOne
-        search[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        search[kSecUseAuthenticationContext as String] = context
         var result: CFTypeRef?
         let status = SecItemCopyMatching(search as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }

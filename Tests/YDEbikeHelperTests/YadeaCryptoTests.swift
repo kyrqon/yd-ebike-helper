@@ -42,7 +42,9 @@ final class YadeaCryptoTests: XCTestCase {
         }
         // This decrypts to the NIST example block ending in FF, not PKCS7.
         let unpadded = try YDEbikeProtocol.parseHex("69C4E0D86A7B0430D8CDB78070B4C55A")
-        XCTAssertThrowsError(try YadeaCrypto.ecbDecrypt(unpadded, key: key))
+        XCTAssertThrowsError(try YadeaCrypto.ecbDecrypt(unpadded, key: key)) { error in
+            XCTAssertEqual(error as? YadeaCryptoError, .invalidPadding)
+        }
     }
 
     func testHandshakeRestartsCBCForEachBlock() throws {
