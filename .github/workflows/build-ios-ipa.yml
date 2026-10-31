@@ -1,0 +1,109 @@
+name: Build iPhone IPA
+
+# Add this file to .github/workflows/build-ios-ipa.yml in your fork of:
+# https://github.com/CBDT-JWT/yd-ebike-helper
+# Run it manually from the Actions tab. No Apple account or certificate is used.
+# The result is UNSIGNED: install it through a local signing tool on Windows.
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # Reviewed upstream source. Deliberately pinned for reproducibility.
+      SOURCE_REVISION: c69e90db0b1d3470bde982afc059ee1ddfd62a7c
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REVISION }}
+          persist-credentials: false
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned iPhone application
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project YDEbikeHelper.xcodeproj \
+            -scheme YDEbikeHelper-iOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: Validate and package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import plistlib
+          import shutil
+          import subprocess
+          import zipfile
+
+          app = Path("build/DerivedData/Build/Products/Release-iphoneos/YD E-Bike Helper.app")
+          if not app.is_dir():
+              raise SystemExit(f"iPhone application not found: {app}")
+          with (app / "Info.plist").open("rb") as source:
+              info = plistlib.load(source)
+          if info.get("DTPlatformName") != "iphoneos":
+              raise SystemExit("Refusing to package a simulator or non-iPhone build")
+          executable = info["CFBundleExecutable"]
+          subprocess.run(
+              ["xcrun", "lipo", "-verify_arch", "arm64", str(app / executable)],
+              check=True,
+          )
+
+          staging = Path("build/ipa-stage")
+          payload = staging / "Payload"
+          payload.mkdir(parents=True, exist_ok=True)
+          shutil.copytree(app, payload / app.name, symlinks=True)
+          output_dir = Path("build/ipa-output")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          ipa = (output_dir / "YDEbikeHelper-unsigned.ipa").resolve()
+          subprocess.run(
+              ["/usr/bin/ditto", "-c", "-k", "--keepParent", "Payload", str(ipa)],
+              cwd=staging,
+              check=True,
+          )
+          with zipfile.ZipFile(ipa) as archive:
+              expected = f"Payload/{app.name}/"
+              assert expected + "Info.plist" in archive.namelist()
+              assert expected + executable in archive.namelist()
+              assert archive.testzip() is None
+          digest = hashlib.sha256(ipa.read_bytes()).hexdigest()
+          ipa.with_suffix(".ipa.sha256").write_text(
+              f"{digest}  {ipa.name}\n", encoding="utf-8"
+          )
+          print(f"Packaged: {ipa.name}")
+          print(f"Bundle ID: {info['CFBundleIdentifier']}")
+          print(f"Minimum iOS: {info.get('MinimumOSVersion', 'unknown')}")
+          print("This IPA is unsigned; sign and install it locally on Windows.")
+          PY
+
+      - name: Upload unsigned iPhone IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: yd-ebike-helper-iphone-unsigned
+          path: |
+            build/ipa-output/YDEbikeHelper-unsigned.ipa
+            build/ipa-output/YDEbikeHelper-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 7
