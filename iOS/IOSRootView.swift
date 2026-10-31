@@ -17,17 +17,23 @@ struct IOSRootView: View {
             navigationPath = [deviceID]
         }
         .alert(
-            "操作失败",
+            bluetooth.lastError != nil ? "操作失败" : (bluetooth.operationNotice?.title ?? "提示"),
             isPresented: Binding(
-                get: { bluetooth.lastError != nil },
-                set: { if !$0 { bluetooth.lastError = nil } }
+                get: { bluetooth.lastError != nil || bluetooth.operationNotice != nil },
+                set: {
+                    if !$0 {
+                        bluetooth.lastError = nil
+                        bluetooth.operationNotice = nil
+                    }
+                }
             )
         ) {
             Button("知道了", role: .cancel) {
                 bluetooth.lastError = nil
+                bluetooth.operationNotice = nil
             }
         } message: {
-            Text(bluetooth.lastError ?? "")
+            Text(bluetooth.lastError ?? bluetooth.operationNotice?.message ?? "")
         }
     }
 }
