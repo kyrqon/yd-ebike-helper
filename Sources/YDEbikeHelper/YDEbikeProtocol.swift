@@ -126,17 +126,7 @@ enum YDEbikeProtocol {
         minute: Int,
         second: Int
     ) throws -> Data {
-        let profile = try authenticationProfile(challenge: challenge)
-        switch profile.flow {
-        case .legacy:
-            break
-        case .tokenV2:
-            throw YDEbikeProtocolError.unsupportedTokenAuthentication
-        case .secretKey:
-            throw YDEbikeProtocolError.unsupportedSecretKeyAuthentication
-        case .unsupportedVersion:
-            throw YDEbikeProtocolError.unsupportedAuthenticationVersion(profile.rawFlags ?? 0)
-        }
+        _ = try requireLegacyAuthentication(challenge: challenge)
 
         let normalized = try normalizedMAC(macAddress)
         let compactMAC = normalized.replacingOccurrences(of: ":", with: "")
@@ -176,6 +166,20 @@ enum YDEbikeProtocol {
             challengeLength: bytes.count,
             rawFlags: bytes.count == 16 ? bytes[13] : nil
         )
+    }
+
+    static func requireLegacyAuthentication(challenge: Data) throws -> AuthenticationProfile {
+        let profile = try authenticationProfile(challenge: challenge)
+        switch profile.flow {
+        case .legacy:
+            return profile
+        case .tokenV2:
+            throw YDEbikeProtocolError.unsupportedTokenAuthentication
+        case .secretKey:
+            throw YDEbikeProtocolError.unsupportedSecretKeyAuthentication
+        case .unsupportedVersion:
+            throw YDEbikeProtocolError.unsupportedAuthenticationVersion(profile.rawFlags ?? 0)
+        }
     }
 
     static func authenticationPacket(

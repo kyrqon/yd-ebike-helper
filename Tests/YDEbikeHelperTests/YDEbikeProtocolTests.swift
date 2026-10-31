@@ -137,6 +137,30 @@ final class YDEbikeProtocolTests: XCTestCase {
         }
     }
 
+    func testLegacyAuthenticationPreflightRejectsUnsupportedFlowsWithoutPacketContext() throws {
+        // This check needs no MAC or clock and can run before subscribing or
+        // preparing any authentication answer.
+        let legacy = try YDEbikeProtocol.requireLegacyAuthentication(
+            challenge: authenticationChallenge(flags: 0x00)
+        )
+        XCTAssertEqual(legacy.flow, .legacy)
+        XCTAssertEqual(legacy.rawFlags, 0x00)
+
+        let cases: [(UInt8, YDEbikeProtocolError)] = [
+            (0x58, .unsupportedTokenAuthentication),
+            (0x10, .unsupportedSecretKeyAuthentication),
+            (0x50, .unsupportedAuthenticationVersion(0x50)),
+            (0x60, .unsupportedAuthenticationVersion(0x60)),
+        ]
+        for (flags, expectedError) in cases {
+            XCTAssertThrowsError(try YDEbikeProtocol.requireLegacyAuthentication(
+                challenge: authenticationChallenge(flags: flags)
+            )) { error in
+                XCTAssertEqual(error as? YDEbikeProtocolError, expectedError)
+            }
+        }
+    }
+
     func testSecretKeyAndUnknownVersionsCannotFallBackToLegacyAnswer() {
         for flags in [UInt8(0x10), 0x18] {
             XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(

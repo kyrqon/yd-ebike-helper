@@ -29,6 +29,8 @@ final class BLEManager: NSObject, ObservableObject {
     private var authenticationReadScheduled = false
     private var authenticationCompleted = false
     private var authenticationResponseStarted = false
+    private var pendingAuthenticationChallenge: Data?
+    private var commandNotificationPending = false
     private var activeAuthenticationWriteMode: YDEbikeProtocol.AuthenticationWriteMode = .automatic
     private var connectionAttemptID = UUID()
     private var connectionFailed = false
@@ -58,7 +60,7 @@ final class BLEManager: NSObject, ObservableObject {
             return "\(formatter.string(from: entry.timestamp)) [\(entry.direction.rawValue)] \(entry.message)\(payload)"
         }
         return ([
-            "YD E-Bike Helper / authentication-diagnostics-1",
+            "YD E-Bike Helper / authentication-diagnostics-2",
             "版本：\(version) (\(build))",
             "源码：\(revision)",
             "系统：\(ProcessInfo.processInfo.operatingSystemVersionString)",
@@ -341,7 +343,10 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
 
-        guard authenticationCompleted, let characteristic = commandWriteCharacteristic else {
+        guard authenticationCompleted,
+            activeDevice?.phase == .ready,
+            let characteristic = commandWriteCharacteristic
+        else {
             reportError("设备尚未完成认证，不能发送指令。")
             return
         }
@@ -353,7 +358,7 @@ final class BLEManager: NSObject, ObservableObject {
             !authenticationStarted,
             let peripheral = activePeripheral,
             let readWrite = authReadWriteCharacteristic,
-            let notify = authNotifyCharacteristic,
+            authNotifyCharacteristic != nil,
             commandWriteCharacteristic != nil
         else {
             return
@@ -362,43 +367,8 @@ final class BLEManager: NSObject, ObservableObject {
         authenticationStarted = true
         updatePhase(.authenticating, for: peripheral.identifier)
         authenticationStatus = "准备读取车辆认证能力"
-        setStage("订阅认证通知", timeout: 5)
-        appendLog(.system, "服务已就绪，先订阅认证通知")
-
-        if notify.isNotifying {
-            scheduleAuthenticationRead(
-                peripheral: peripheral,
-                characteristic: readWrite
-            )
-        } else if notify.properties.contains(.notify) || notify.properties.contains(.indicate) {
-            peripheral.setNotifyValue(true, for: notify)
-
-            // 某些外设不会回调通知状态。超时后仍继续认证。
-            let attemptID = connectionAttemptID
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self, weak peripheral] in
-                guard
-                    let self,
-                    let peripheral,
-                    self.activePeripheral === peripheral,
-                    self.connectionAttemptID == attemptID,
-                    !self.connectionFailed,
-                    !self.disconnectRequested,
-                    let readWrite = self.authReadWriteCharacteristic
-                else {
-                    return
-                }
-                self.scheduleAuthenticationRead(
-                    peripheral: peripheral,
-                    characteristic: readWrite
-                )
-            }
-        } else {
-            appendLog(.error, "认证通知特征不支持 Notify/Indicate，继续尝试读取挑战值")
-            scheduleAuthenticationRead(
-                peripheral: peripheral,
-                characteristic: readWrite
-            )
-        }
+        appendLog(.system, "服务已就绪：先读取挑战值，认证前不订阅命令通知")
+        scheduleAuthenticationRead(peripheral: peripheral, characteristic: readWrite)
     }
 
     private func configureDemoData() {
@@ -491,8 +461,13 @@ final class BLEManager: NSObject, ObservableObject {
         characteristic: CBCharacteristic
     ) {
         guard !authenticationReadScheduled else { return }
+        guard characteristic.properties.contains(.read) else {
+            failConnection("认证特征不支持 Read，不能读取挑战值。")
+            return
+        }
         authenticationReadScheduled = true
-        appendLog(.system, "认证通知就绪，等待 400 ms")
+        setStage("读取认证挑战值", timeout: 8)
+        appendLog(.system, "发现特征后等待 400 ms，再读取挑战值；尚未请求任何通知订阅")
         let attemptID = connectionAttemptID
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak peripheral] in
@@ -507,35 +482,46 @@ final class BLEManager: NSObject, ObservableObject {
                 return
             }
 
-            self.appendLog(.system, "读取连接 RSSI")
-            peripheral.readRSSI()
+            self.authenticationStatus = "正在读取车辆认证能力"
+            self.appendLog(.system, "请求读取认证挑战值：\(characteristic.uuid.uuidString)")
+            peripheral.readValue(for: characteristic)
+        }
+    }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak peripheral] in
-                guard
-                    let self,
-                    let peripheral,
-                    self.activePeripheral === peripheral,
-                    self.connectionAttemptID == attemptID,
-                    !self.connectionFailed,
-                    !self.disconnectRequested
-                else {
-                    return
-                }
-                guard characteristic.properties.contains(.read) else {
-                    self.failConnection("认证特征不支持 Read，不能读取挑战值。")
-                    return
-                }
-                self.setStage("读取认证挑战值", timeout: 8)
-                self.authenticationStatus = "正在读取车辆认证能力"
-                self.appendLog(.system, "读取认证挑战值")
-                peripheral.readValue(for: characteristic)
+    private func prepareAuthentication(challenge: Data) {
+        guard pendingAuthenticationChallenge == nil, !authenticationResponseStarted,
+            let peripheral = activePeripheral,
+            let notify = authNotifyCharacteristic
+        else { return }
+        setStage("识别认证能力")
+        do {
+            let profile = try YDEbikeProtocol.authenticationProfile(challenge: challenge)
+            appendLog(.system, "读取成功，认证能力：\(profile.diagnosticDescription)")
+            _ = try YDEbikeProtocol.requireLegacyAuthentication(challenge: challenge)
+            pendingAuthenticationChallenge = challenge
+            setStage("订阅认证通知", timeout: 8)
+            authenticationStatus = "挑战值已读取，等待认证通知订阅确认"
+            if notify.isNotifying {
+                appendLog(.system, "认证通知已启用，继续生成应答")
+                authenticate(challenge: challenge)
+            } else if notify.properties.contains(.notify) || notify.properties.contains(.indicate) {
+                appendLog(.system, "请求订阅认证通知：\(notify.uuid.uuidString)")
+                peripheral.setNotifyValue(true, for: notify)
+            } else {
+                failConnection("认证通知特征不支持 Notify/Indicate。")
             }
+        } catch {
+            failConnection(error.localizedDescription)
         }
     }
 
     private func authenticate(challenge: Data) {
-        guard !authenticationResponseStarted else { return }
+        guard !authenticationResponseStarted,
+            pendingAuthenticationChallenge == challenge,
+            authNotifyCharacteristic?.isNotifying == true
+        else { return }
         authenticationResponseStarted = true
+        pendingAuthenticationChallenge = nil
         guard
             activePeripheral != nil,
             let macAddress = activeMACAddress,
@@ -652,14 +638,41 @@ final class BLEManager: NSObject, ObservableObject {
                 : "\(write.label)已提交蓝牙发送队列；Write Without Response 没有车端写确认")
             if write.completesAuthentication, let peripheral = activePeripheral {
                 authenticationCompleted = true
-                updatePhase(.ready, for: peripheral.identifier)
-                authenticationStatus = "旧版认证应答已提交，车端结果尚未验证"
-                setStage("旧版应答已提交")
+                authenticationStatus = "旧版应答已提交，正在准备命令通知"
                 appendLog(.system, authenticationStatus)
-                peripheral.readRSSI()
+                subscribeCommandNotifications(peripheral: peripheral)
             }
         }
         drainWriteQueue()
+    }
+
+    private func subscribeCommandNotifications(peripheral: CBPeripheral) {
+        guard let notify = commandNotifyCharacteristic else {
+            failConnection("命令服务缺少通知特征，无法观察后续命令结果。")
+            return
+        }
+        commandNotificationPending = true
+        setStage("订阅命令通知", timeout: 8)
+        if notify.isNotifying {
+            finishConnectionSetup()
+        } else if notify.properties.contains(.notify) || notify.properties.contains(.indicate) {
+            appendLog(.system, "认证应答提交后，请求订阅命令通知：\(notify.uuid.uuidString)")
+            peripheral.setNotifyValue(true, for: notify)
+        } else {
+            failConnection("命令通知特征不支持 Notify/Indicate。")
+        }
+    }
+
+    private func finishConnectionSetup() {
+        guard authenticationCompleted, commandNotificationPending,
+            commandNotifyCharacteristic?.isNotifying == true,
+            let peripheral = activePeripheral
+        else { return }
+        commandNotificationPending = false
+        authenticationStatus = "旧版应答及通知已就绪，车端认证结果尚未验证"
+        setStage("旧版应答及通知已就绪")
+        updatePhase(.ready, for: peripheral.identifier)
+        appendLog(.system, authenticationStatus)
     }
 
     private func resetProtocolState() {
@@ -673,6 +686,8 @@ final class BLEManager: NSObject, ObservableObject {
         authenticationReadScheduled = false
         authenticationCompleted = false
         authenticationResponseStarted = false
+        pendingAuthenticationChallenge = nil
+        commandNotificationPending = false
         writeQueue.removeAll()
         activeWrite = nil
     }
@@ -1055,11 +1070,6 @@ extension BLEManager: CBPeripheralDelegate {
                 failConnection("命令服务缺少写入特征。")
                 return
             }
-            if let notify = commandNotifyCharacteristic,
-                notify.properties.contains(.notify) || notify.properties.contains(.indicate)
-            {
-                peripheral.setNotifyValue(true, for: notify)
-            }
         }
         beginAuthenticationIfPossible()
     }
@@ -1079,8 +1089,8 @@ extension BLEManager: CBPeripheralDelegate {
         appendLog(.received, characteristic.uuid.uuidString, data: data)
         switch characteristic.uuid.uuidString.uppercased() {
         case YDEbikeProtocol.authenticationReadWriteCharacteristic:
-            if authenticationStarted && !authenticationCompleted {
-                authenticate(challenge: data)
+            if authenticationStarted && authenticationReadScheduled && !authenticationCompleted {
+                prepareAuthentication(challenge: data)
             }
         case YDEbikeProtocol.authenticationNotifyCharacteristic:
             appendLog(.system, "已收到认证通知，原始内容已记录；当前旧版流程不把该通知自动判为认证成功")
@@ -1115,24 +1125,26 @@ extension BLEManager: CBPeripheralDelegate {
     ) {
         guard acceptsCallbacks(from: peripheral) else { return }
         if let error {
-            appendLog(
-                .error,
-                "[\(connectionStage)] 订阅 \(characteristic.uuid.uuidString) 失败：\(errorDescription(error))"
-            )
-        } else {
-            appendLog(.system, "已订阅通知 \(characteristic.uuid.uuidString)")
+            failConnection("订阅 \(characteristic.uuid.uuidString) 失败：\(errorDescription(error))")
+            return
         }
+        guard characteristic.isNotifying else {
+            failConnection("通知状态回调未启用通知：\(characteristic.uuid.uuidString)")
+            return
+        }
+        appendLog(.system, "通知订阅已确认：\(characteristic.uuid.uuidString)")
 
         if characteristic.uuid.uuidString.uppercased()
             == YDEbikeProtocol.authenticationNotifyCharacteristic,
             authenticationStarted,
-            let readWrite = authReadWriteCharacteristic
+            let challenge = pendingAuthenticationChallenge
         {
-            // 即使订阅失败也继续认证，因此这里不因 error 提前退出。
-            scheduleAuthenticationRead(
-                peripheral: peripheral,
-                characteristic: readWrite
-            )
+            authenticate(challenge: challenge)
+        } else if characteristic.uuid.uuidString.uppercased()
+            == YDEbikeProtocol.commandNotifyCharacteristic,
+            commandNotificationPending
+        {
+            finishConnectionSetup()
         }
     }
 
