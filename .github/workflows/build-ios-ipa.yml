@@ -67,7 +67,7 @@ jobs:
               raise SystemExit("Refusing to package a simulator or non-iPhone build")
           executable = info["CFBundleExecutable"]
           subprocess.run(
-              ["xcrun", "lipo", "-verify_arch", "arm64", str(app / executable)],
+              ["xcrun", "lipo", str(app / executable), "-verify_arch", "arm64"],
               check=True,
           )
 
