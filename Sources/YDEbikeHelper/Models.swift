@@ -1,5 +1,45 @@
 import Foundation
 
+/// Explicit user input must survive advertisement updates and system suggestions.
+enum ConnectionMACSelection {
+    static func resolve(
+        userInput: String,
+        systemAddress: String?,
+        preferredCandidate: String?
+    ) throws -> String {
+        let entered = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !entered.isEmpty {
+            return try YDEbikeProtocol.normalizedMAC(entered)
+        }
+        for suggestion in [systemAddress, preferredCandidate] {
+            if let suggestion,
+                let normalized = try? YDEbikeProtocol.normalizedMAC(suggestion)
+            {
+                return normalized
+            }
+        }
+        throw YDEbikeProtocolError.invalidMACAddress
+    }
+}
+
+enum AuthenticationWriteSelection {
+    static func usesResponse(
+        mode: YDEbikeProtocol.AuthenticationWriteMode,
+        supportsResponse: Bool,
+        supportsWithoutResponse: Bool
+    ) -> Bool? {
+        switch mode {
+        case .automatic:
+            if supportsWithoutResponse { return false }
+            return supportsResponse ? true : nil
+        case .withResponse:
+            return supportsResponse ? true : nil
+        case .withoutResponse:
+            return supportsWithoutResponse ? false : nil
+        }
+    }
+}
+
 enum DeviceConnectionPhase: String, Codable {
     case discovered
     case connecting
@@ -354,3 +394,4 @@ extension Data {
         map { String(format: "%02X", $0) }.joined(separator: " ")
     }
 }
+

@@ -32,6 +32,7 @@ struct IOSRootView: View {
     }
 }
 
+@MainActor
 private struct DeviceDiscoveryView: View {
     @EnvironmentObject private var bluetooth: BLEManager
     @State private var showsFilters = false
@@ -40,6 +41,7 @@ private struct DeviceDiscoveryView: View {
         ScrollView {
             LazyVStack(spacing: 14) {
                 bluetoothStatusCard
+                YadeaAccountEntry()
 
                 if bluetooth.visibleDevices.isEmpty {
                     emptyState
@@ -255,12 +257,14 @@ private struct IOSDeviceRow: View {
     }
 }
 
+@MainActor
 private struct IOSDeviceDetailView: View {
     @EnvironmentObject private var bluetooth: BLEManager
 
     let deviceID: UUID
 
     @State private var macAddress = ""
+    @State private var authenticationWriteMode: YDEbikeProtocol.AuthenticationWriteMode = .automatic
     @State private var customHex = ""
     @State private var confirmation: PowerConfirmation?
     @State private var showsLogs = false
@@ -397,12 +401,21 @@ private struct IOSDeviceDetailView: View {
     }
 
     private func connectionCard(_ device: DiscoveredDevice) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let editingDisabled = device.isConnected || device.phase == .connecting
+            || device.phase == .disconnecting
+
+        return VStack(alignment: .leading, spacing: 14) {
             IOSSectionHeader(
                 title: "连接与认证",
                 subtitle: "iPhone 不公开硬件地址，优先从车辆广播中识别",
                 systemImage: "link"
             )
+
+            YadeaAccountEntry()
+                .disabled(editingDisabled)
+            Text("V2 认证请先登录雅迪账号并选择本人绑定车辆。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 7) {
                 Text("设备 MAC 地址")
@@ -420,7 +433,7 @@ private struct IOSDeviceDetailView: View {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
                     }
-                    .disabled(device.isConnected)
+                    .disabled(editingDisabled)
             }
 
             if device.advertisement.macCandidates.isEmpty {
@@ -453,9 +466,23 @@ private struct IOSDeviceDetailView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(device.isConnected)
+                        .disabled(editingDisabled)
                     }
                 }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("认证写入方式", selection: $authenticationWriteMode) {
+                    ForEach(YDEbikeProtocol.AuthenticationWriteMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(editingDisabled)
+
+                Text("仅用于认证通信兼容，通常保持“自动（兼容）”。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if device.isConnected || device.phase == .ready {
@@ -469,7 +496,11 @@ private struct IOSDeviceDetailView: View {
                 .controlSize(.large)
             } else {
                 Button {
-                    bluetooth.connect(to: device.id, macAddress: macAddress)
+                    bluetooth.connect(
+                        to: device.id,
+                        macAddress: macAddress,
+                        writeMode: authenticationWriteMode
+                    )
                 } label: {
                     Label("连接并认证", systemImage: "link")
                         .frame(maxWidth: .infinity)
@@ -482,6 +513,10 @@ private struct IOSDeviceDetailView: View {
                         || macAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
             }
+
+            Text(bluetooth.authenticationStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .iosCard()
     }
@@ -631,19 +666,20 @@ private struct IOSDeviceDetailView: View {
     }
 
     private func loadSuggestedMAC() {
-        guard let device else { return }
-        if device.isConnected, !macAddress.isEmpty {
-            return
-        }
-
-        if let highConfidence = bluetooth.preferredMACCandidate(for: device.id) {
-            macAddress = highConfidence.address
-            return
-        }
+        guard let device, macAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
 
         let saved = bluetooth.savedMACAddress(for: device.id)
         if !saved.isEmpty {
             macAddress = saved
+            return
+        }
+
+        guard !device.isConnected, device.phase != .connecting, device.phase != .disconnecting
+        else { return }
+
+        if let highConfidence = bluetooth.preferredMACCandidate(for: device.id) {
+            macAddress = highConfidence.address
         }
     }
 }
@@ -690,7 +726,10 @@ private struct IOSLogView: View {
                         dismiss()
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    ShareLink(item: bluetooth.diagnosticReport) {
+                        Label("导出", systemImage: "square.and.arrow.up")
+                    }
                     Button("清空", role: .destructive) {
                         bluetooth.clearLogs()
                     }
@@ -751,6 +790,7 @@ private struct IOSFullLogRow: View {
             Text(entry.message)
                 .font(.subheadline)
                 .foregroundStyle(entry.direction == .error ? .red : .primary)
+                .textSelection(.enabled)
             if let data = entry.data {
                 Text(data.spacedHex)
                     .font(.caption.monospaced())
@@ -841,3 +881,4 @@ private func logColor(_ direction: BLELogDirection) -> Color {
     case .error: return .red
     }
 }
+
