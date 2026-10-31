@@ -32,6 +32,7 @@ struct IOSRootView: View {
     }
 }
 
+@MainActor
 private struct DeviceDiscoveryView: View {
     @EnvironmentObject private var bluetooth: BLEManager
     @State private var showsFilters = false
@@ -40,6 +41,7 @@ private struct DeviceDiscoveryView: View {
         ScrollView {
             LazyVStack(spacing: 14) {
                 bluetoothStatusCard
+                YadeaAccountEntry()
 
                 if bluetooth.visibleDevices.isEmpty {
                     emptyState
@@ -255,6 +257,7 @@ private struct IOSDeviceRow: View {
     }
 }
 
+@MainActor
 private struct IOSDeviceDetailView: View {
     @EnvironmentObject private var bluetooth: BLEManager
 
@@ -407,6 +410,12 @@ private struct IOSDeviceDetailView: View {
                 subtitle: "iPhone 不公开硬件地址，优先从车辆广播中识别",
                 systemImage: "link"
             )
+
+            YadeaAccountEntry()
+                .disabled(editingDisabled)
+            Text("V2 认证请先登录雅迪账号并选择本人绑定车辆。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 7) {
                 Text("设备 MAC 地址")

@@ -31,6 +31,12 @@ final class BLEManager: NSObject, ObservableObject {
     private var authenticationResponseStarted = false
     private var pendingAuthenticationChallenge: Data?
     private var commandNotificationPending = false
+    private var authenticationUsesToken = false
+    private var v2WriteConfirmed = false
+    private var waitingForV2Result = false
+    private var v2Result: YadeaV2Handshake.Response?
+    private var tokenFetchTask: Task<Void, Never>?
+    private var accountChangeObserver: NSObjectProtocol?
     private var activeAuthenticationWriteMode: YDEbikeProtocol.AuthenticationWriteMode = .automatic
     private var connectionAttemptID = UUID()
     private var connectionFailed = false
@@ -60,7 +66,7 @@ final class BLEManager: NSObject, ObservableObject {
             return "\(formatter.string(from: entry.timestamp)) [\(entry.direction.rawValue)] \(entry.message)\(payload)"
         }
         return ([
-            "YD E-Bike Helper / authentication-diagnostics-2",
+            "YD E-Bike Helper / authentication-diagnostics-3",
             "版本：\(version) (\(build))",
             "源码：\(revision)",
             "系统：\(ProcessInfo.processInfo.operatingSystemVersionString)",
@@ -76,6 +82,7 @@ final class BLEManager: NSObject, ObservableObject {
         let characteristic: CBCharacteristic
         let label: String
         let completesAuthentication: Bool
+        let isSensitive: Bool
     }
 
     private var writeQueue: [PendingWrite] = []
@@ -94,10 +101,24 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         super.init()
+        accountChangeObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name("YadeaAccountAuthorizationChanged"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.authenticationUsesToken, self.activePeripheral != nil else { return }
+            self.failConnection("雅迪账号已退出或变更，请重新选择本人绑定车辆后连接。")
+        }
         if isDemoMode {
             configureDemoData()
         } else {
             central = CBCentralManager(delegate: self, queue: .main)
+        }
+    }
+
+    deinit {
+        if let accountChangeObserver {
+            NotificationCenter.default.removeObserver(accountChangeObserver)
         }
     }
 
@@ -497,7 +518,12 @@ final class BLEManager: NSObject, ObservableObject {
         do {
             let profile = try YDEbikeProtocol.authenticationProfile(challenge: challenge)
             appendLog(.system, "读取成功，认证能力：\(profile.diagnosticDescription)")
-            _ = try YDEbikeProtocol.requireLegacyAuthentication(challenge: challenge)
+            if profile.flow == .tokenV2 {
+                authenticationUsesToken = true
+                appendLog(.system, "采用 V2 Token 握手：需要已登录账号及匹配的本人绑定车辆")
+            } else {
+                _ = try YDEbikeProtocol.requireLegacyAuthentication(challenge: challenge)
+            }
             pendingAuthenticationChallenge = challenge
             setStage("订阅认证通知", timeout: 8)
             authenticationStatus = "挑战值已读取，等待认证通知订阅确认"
@@ -534,6 +560,10 @@ final class BLEManager: NSObject, ObservableObject {
         do {
             let profile = try YDEbikeProtocol.authenticationProfile(challenge: challenge)
             appendLog(.system, "认证能力：\(profile.diagnosticDescription)")
+            if authenticationUsesToken {
+                fetchTokenAndAuthenticate(challenge: challenge, macAddress: macAddress)
+                return
+            }
             let packet = try YDEbikeProtocol.authenticationPacket(
                 challenge: challenge,
                 macAddress: macAddress
@@ -550,18 +580,95 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    private func fetchTokenAndAuthenticate(challenge: Data, macAddress: String) {
+        setStage("获取本人车辆 V2 授权", timeout: 35)
+        authenticationStatus = "正在获取所选本人绑定车辆的蓝牙授权"
+        let attemptID = connectionAttemptID
+        tokenFetchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let credentials = try await YadeaAccount.shared.credentials(for: macAddress)
+                try Task.checkCancellation()
+                guard self.connectionAttemptID == attemptID,
+                    self.activePeripheral != nil,
+                    !self.connectionFailed,
+                    !self.disconnectRequested,
+                    let characteristic = self.authReadWriteCharacteristic
+                else { return }
+                // The account layer has checked that the selected bound vehicle
+                // matches this connection MAC. No token or plaintext enters logs.
+                let packet = try YadeaV2Handshake.encryptedPacket(
+                    dkInfo: credentials.tokenHex,
+                    challenge: challenge,
+                    macAddress: credentials.macAddress,
+                    roles: credentials.roles,
+                    protocolVersion: credentials.protocolVersion
+                )
+                self.appendLog(.system, "本人车辆授权已获取，V2 应答已生成（授权材料与密文不写入日志）")
+                self.waitingForV2Result = true
+                self.v2WriteConfirmed = false
+                self.v2Result = nil
+                self.enqueueWrite(
+                    packet,
+                    to: characteristic,
+                    label: "V2 认证响应",
+                    completesAuthentication: true,
+                    isSensitive: true
+                )
+            } catch {
+                guard self.connectionAttemptID == attemptID,
+                    self.activePeripheral != nil,
+                    !self.connectionFailed,
+                    !self.disconnectRequested,
+                    !(error is CancellationError)
+                else { return }
+                self.failConnection(error.localizedDescription)
+            }
+        }
+    }
+
+    private func receiveV2AuthenticationResult(_ data: Data) {
+        guard authenticationUsesToken, waitingForV2Result else { return }
+        do {
+            let response = try YadeaV2Handshake.response(data)
+            appendLog(.system, "V2 车端结果：result=\(response.result)，remaining=\(response.remainingUses)")
+            guard response.success else {
+                failConnection("车辆未通过 V2 认证（结果码 \(response.result)），未开放控制。")
+                return
+            }
+            v2Result = response
+            completeV2AuthenticationIfPossible()
+        } catch {
+            failConnection("无法解析 V2 认证结果：\(error.localizedDescription)")
+        }
+    }
+
+    private func completeV2AuthenticationIfPossible() {
+        guard authenticationUsesToken, waitingForV2Result,
+            v2WriteConfirmed, v2Result?.success == true,
+            let peripheral = activePeripheral
+        else { return }
+        waitingForV2Result = false
+        authenticationCompleted = true
+        authenticationStatus = "车辆已确认 V2 认证成功，正在准备命令通知"
+        appendLog(.system, authenticationStatus)
+        subscribeCommandNotifications(peripheral: peripheral)
+    }
+
     private func enqueueWrite(
         _ data: Data,
         to characteristic: CBCharacteristic,
         label: String,
-        completesAuthentication: Bool = false
+        completesAuthentication: Bool = false,
+        isSensitive: Bool = false
     ) {
         writeQueue.append(
             PendingWrite(
                 data: data,
                 characteristic: characteristic,
                 label: label,
-                completesAuthentication: completesAuthentication
+                completesAuthentication: completesAuthentication,
+                isSensitive: isSensitive
             )
         )
         drainWriteQueue()
@@ -579,7 +686,10 @@ final class BLEManager: NSObject, ObservableObject {
         let next = writeQueue.removeFirst()
         let properties = next.characteristic.properties
         let usesResponse: Bool?
-        if next.completesAuthentication {
+        if next.completesAuthentication && authenticationUsesToken {
+            usesResponse = activeAuthenticationWriteMode != .withoutResponse
+                && properties.contains(.write) ? true : nil
+        } else if next.completesAuthentication {
             usesResponse = AuthenticationWriteSelection.usesResponse(
                 mode: activeAuthenticationWriteMode,
                 supportsResponse: properties.contains(.write),
@@ -613,7 +723,11 @@ final class BLEManager: NSObject, ObservableObject {
         activeWriteRequiresResponse = usesResponse
         setStage(next.completesAuthentication ? "写入认证应答" : "写入\(next.label)", timeout: 8)
         appendLog(.system, "\(next.label)使用 \(usesResponse ? "Write Request" : "Write Without Response")")
-        appendLog(.sent, next.label, data: next.data)
+        appendLog(
+            .sent,
+            next.isSensitive ? "\(next.label)，\(next.data.count) 字节（内容已隐藏）" : next.label,
+            data: next.isSensitive ? nil : next.data
+        )
         peripheral.writeValue(next.data, for: next.characteristic, type: writeType)
 
         if writeType == .withoutResponse {
@@ -637,10 +751,17 @@ final class BLEManager: NSObject, ObservableObject {
                 ? "\(write.label)已获得 GATT 写确认；不等于车辆业务认证成功"
                 : "\(write.label)已提交蓝牙发送队列；Write Without Response 没有车端写确认")
             if write.completesAuthentication, let peripheral = activePeripheral {
-                authenticationCompleted = true
-                authenticationStatus = "旧版应答已提交，正在准备命令通知"
-                appendLog(.system, authenticationStatus)
-                subscribeCommandNotifications(peripheral: peripheral)
+                if authenticationUsesToken {
+                    v2WriteConfirmed = true
+                    authenticationStatus = "V2 应答写入已确认，等待车辆认证结果"
+                    setStage("等待 V2 认证结果", timeout: 8)
+                    completeV2AuthenticationIfPossible()
+                } else {
+                    authenticationCompleted = true
+                    authenticationStatus = "旧版应答已提交，正在准备命令通知"
+                    appendLog(.system, authenticationStatus)
+                    subscribeCommandNotifications(peripheral: peripheral)
+                }
             }
         }
         drainWriteQueue()
@@ -669,13 +790,17 @@ final class BLEManager: NSObject, ObservableObject {
             let peripheral = activePeripheral
         else { return }
         commandNotificationPending = false
-        authenticationStatus = "旧版应答及通知已就绪，车端认证结果尚未验证"
-        setStage("旧版应答及通知已就绪")
+        authenticationStatus = authenticationUsesToken
+            ? "V2 车端认证成功，通知已就绪"
+            : "旧版应答及通知已就绪，车端认证结果尚未验证"
+        setStage(authenticationUsesToken ? "V2 认证及通知已就绪" : "旧版应答及通知已就绪")
         updatePhase(.ready, for: peripheral.identifier)
         appendLog(.system, authenticationStatus)
     }
 
     private func resetProtocolState() {
+        tokenFetchTask?.cancel()
+        tokenFetchTask = nil
         stageTimeoutWorkItem?.cancel()
         stageTimeoutWorkItem = nil
         authReadWriteCharacteristic = nil
@@ -688,6 +813,10 @@ final class BLEManager: NSObject, ObservableObject {
         authenticationResponseStarted = false
         pendingAuthenticationChallenge = nil
         commandNotificationPending = false
+        authenticationUsesToken = false
+        v2WriteConfirmed = false
+        waitingForV2Result = false
+        v2Result = nil
         writeQueue.removeAll()
         activeWrite = nil
     }
@@ -1086,14 +1215,28 @@ extension BLEManager: CBPeripheralDelegate {
         }
         guard let data = characteristic.value else { return }
 
-        appendLog(.received, characteristic.uuid.uuidString, data: data)
+        let uuid = characteristic.uuid.uuidString.uppercased()
+        let isV2Challenge = uuid == YDEbikeProtocol.authenticationReadWriteCharacteristic
+            && (try? YDEbikeProtocol.authenticationProfile(challenge: data).flow) == .tokenV2
+        let hideData = isV2Challenge
+            || (uuid == YDEbikeProtocol.authenticationNotifyCharacteristic && authenticationUsesToken)
+        appendLog(
+            .received,
+            hideData ? "\(characteristic.uuid.uuidString)，\(data.count) 字节（V2 认证内容已隐藏）"
+                : characteristic.uuid.uuidString,
+            data: hideData ? nil : data
+        )
         switch characteristic.uuid.uuidString.uppercased() {
         case YDEbikeProtocol.authenticationReadWriteCharacteristic:
             if authenticationStarted && authenticationReadScheduled && !authenticationCompleted {
                 prepareAuthentication(challenge: data)
             }
         case YDEbikeProtocol.authenticationNotifyCharacteristic:
-            appendLog(.system, "已收到认证通知，原始内容已记录；当前旧版流程不把该通知自动判为认证成功")
+            if authenticationUsesToken {
+                receiveV2AuthenticationResult(data)
+            } else {
+                appendLog(.system, "已收到认证通知；当前旧版流程不把该通知自动判为认证成功")
+            }
         case YDEbikeProtocol.commandNotifyCharacteristic:
             if let code = YDEbikeProtocol.commandResponseCode(from: data) {
                 appendLog(

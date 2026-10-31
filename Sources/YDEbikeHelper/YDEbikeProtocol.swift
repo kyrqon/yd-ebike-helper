@@ -18,7 +18,7 @@ enum YDEbikeProtocolError: LocalizedError, Equatable {
         case .unsupportedChallengeLength(let count):
             return "认证挑战值为 \(count) 字节：当前仅识别 3 字节旧版随机数或 16 字节 RandKey，已停止认证。"
         case .unsupportedTokenAuthentication:
-            return "设备要求 V2 Token 鉴权，当前版本未接入账号与云端授权，已停止发送旧版认证应答。"
+            return "设备使用 V2 Token 鉴权，不能发送旧版应答。请先登录雅迪账号并选择本人绑定车辆。"
         case .unsupportedSecretKeyAuthentication:
             return "设备的认证能力标志指向 SecretKey 流程，当前版本不支持，已停止发送旧版认证应答。"
         case .unsupportedAuthenticationVersion(let flags):
@@ -89,7 +89,7 @@ enum YDEbikeProtocol {
             let description: String
             switch flow {
             case .legacy: description = "旧版认证候选，兼容性仍需实车确认"
-            case .tokenV2: description = "V2 Token 鉴权，当前不支持"
+            case .tokenV2: description = "V2 Token 鉴权，需要本人账号及车辆授权"
             case .secretKey: description = "V2 SecretKey 流程，当前不支持"
             case .unsupportedVersion: description = "尚未支持的认证版本"
             }

@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct ContentView: View {
     @EnvironmentObject private var bluetooth: BLEManager
     @State private var selectedDeviceID: UUID?
@@ -147,6 +148,8 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 66, alignment: .trailing)
                 }
+
+                YadeaAccountEntry()
             }
             .padding(18)
 
@@ -236,6 +239,11 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top, spacing: 14) {
                     VStack(alignment: .leading, spacing: 6) {
+                        YadeaAccountEntry()
+                            .disabled(editingDisabled)
+                        Text("V2 认证请先登录并选择本人绑定车辆。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         Text("设备 MAC 地址")
                             .font(.subheadline.weight(.medium))
                         TextField("A1:B2:C3:D4:E5:F6", text: $macAddress)

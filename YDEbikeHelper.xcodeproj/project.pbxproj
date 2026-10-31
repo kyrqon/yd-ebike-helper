@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		13A000000000000000000001 /* YadeaCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13B000000000000000000001 /* YadeaCrypto.swift */; };
+		13A000000000000000000002 /* YadeaV2Handshake.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13B000000000000000000002 /* YadeaV2Handshake.swift */; };
+		13A000000000000000000003 /* YadeaAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13B000000000000000000003 /* YadeaAccount.swift */; };
+		13A000000000000000000004 /* YadeaAccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13B000000000000000000004 /* YadeaAccountView.swift */; };
 		10A000000000000000000001 /* YDEbikeHelperIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10B000000000000000000001 /* YDEbikeHelperIOSApp.swift */; };
 		10A000000000000000000002 /* IOSRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10B000000000000000000002 /* IOSRootView.swift */; };
 		10A000000000000000000003 /* BLEManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10B000000000000000000003 /* BLEManager.swift */; };
@@ -25,6 +29,10 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		13B000000000000000000001 /* YadeaCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadeaCrypto.swift; sourceTree = "<group>"; };
+		13B000000000000000000002 /* YadeaV2Handshake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadeaV2Handshake.swift; sourceTree = "<group>"; };
+		13B000000000000000000003 /* YadeaAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadeaAccount.swift; sourceTree = "<group>"; };
+		13B000000000000000000004 /* YadeaAccountView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadeaAccountView.swift; sourceTree = "<group>"; };
 		10B000000000000000000001 /* YDEbikeHelperIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YDEbikeHelperIOSApp.swift; sourceTree = "<group>"; };
 		10B000000000000000000002 /* IOSRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSRootView.swift; sourceTree = "<group>"; };
 		10B000000000000000000003 /* BLEManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEManager.swift; sourceTree = "<group>"; };
@@ -83,6 +91,10 @@
 				10B000000000000000000004 /* Models.swift */,
 				10B000000000000000000005 /* YDEbikeProtocol.swift */,
 				10B000000000000000000006 /* PeripheralAddressResolver.swift */,
+				13B000000000000000000001 /* YadeaCrypto.swift */,
+				13B000000000000000000002 /* YadeaV2Handshake.swift */,
+				13B000000000000000000003 /* YadeaAccount.swift */,
+				13B000000000000000000004 /* YadeaAccountView.swift */,
 			);
 			path = Sources/YDEbikeHelper;
 			sourceTree = "<group>";
@@ -194,6 +206,10 @@
 				10A000000000000000000004 /* Models.swift in Sources */,
 				10A000000000000000000005 /* YDEbikeProtocol.swift in Sources */,
 				10A000000000000000000006 /* PeripheralAddressResolver.swift in Sources */,
+				13A000000000000000000001 /* YadeaCrypto.swift in Sources */,
+				13A000000000000000000002 /* YadeaV2Handshake.swift in Sources */,
+				13A000000000000000000003 /* YadeaAccount.swift in Sources */,
+				13A000000000000000000004 /* YadeaAccountView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -397,3 +413,4 @@
 	};
 	rootObject = 10E000000000000000000002 /* Project object */;
 }
+
