@@ -31,6 +31,140 @@ final class YDEbikeProtocolTests: XCTestCase {
         )
     }
 
+    func testAuthenticationProfileDistinguishesCapabilitiesFromVersion() throws {
+        let short = try YDEbikeProtocol.authenticationProfile(
+            challenge: Data([0x12, 0x34, 0x56])
+        )
+        XCTAssertEqual(short.challengeLength, 3)
+        XCTAssertNil(short.rawFlags)
+        XCTAssertEqual(short.flow, .legacy)
+
+        // Flags are fixtures of the observed layout, not evidence that a
+        // particular vehicle model supports one of these authentication flows.
+        let cases: [(UInt8, YDEbikeProtocol.AuthenticationFlow, Bool, Bool, Bool)] = [
+            (0x00, .legacy, false, false, false),
+            (0x08, .legacy, true, false, false),
+            (0x40, .legacy, false, false, false),
+            (0x10, .secretKey, false, true, true),
+            (0x18, .secretKey, true, true, true),
+            (0x50, .unsupportedVersion, false, true, false),
+            (0x58, .tokenV2, true, true, false),
+            (0x59, .tokenV2, true, true, false),
+            (0x60, .unsupportedVersion, false, false, false),
+            (0x70, .unsupportedVersion, false, false, false),
+        ]
+        for (flags, flow, tokenAuth, authVersion2, requiresSecretKey) in cases {
+            let profile = try YDEbikeProtocol.authenticationProfile(
+                challenge: authenticationChallenge(flags: flags)
+            )
+            XCTAssertEqual(profile.challengeLength, 16)
+            XCTAssertEqual(profile.rawFlags, flags)
+            XCTAssertEqual(profile.flow, flow, "flags=\(flags)")
+            XCTAssertEqual(profile.tokenAuth, tokenAuth, "flags=\(flags)")
+            XCTAssertEqual(profile.authVersion2, authVersion2, "flags=\(flags)")
+            XCTAssertEqual(profile.requiresSecretKey, requiresSecretKey, "flags=\(flags)")
+        }
+    }
+
+    func testAuthenticationRejectsMalformedChallengeBeforeBuildingAnAnswer() {
+        for length in 0..<3 {
+            XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(
+                challenge: Data(repeating: 0, count: length),
+                macAddress: "A1:B2:C3:D4:E5:F6",
+                hour: 10, minute: 20, second: 30
+            )) { error in
+                XCTAssertEqual(error as? YDEbikeProtocolError, .challengeTooShort)
+            }
+        }
+        for length in [4, 9, 13, 14, 15, 17, 32] {
+            XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(
+                challenge: Data(repeating: 0, count: length),
+                macAddress: "A1:B2:C3:D4:E5:F6",
+                hour: 10, minute: 20, second: 30
+            )) { error in
+                XCTAssertEqual(error as? YDEbikeProtocolError, .unsupportedChallengeLength(length))
+            }
+        }
+    }
+
+    func testExtendedLegacyChallengePreservesOriginalAnswer() throws {
+        let original = try YDEbikeProtocol.authenticationPacket(
+            challenge: Data([0x12, 0x34, 0x56]),
+            macAddress: "A1:B2:C3:D4:E5:F6",
+            hour: 10, minute: 20, second: 30
+        )
+        for flags in [UInt8(0x00), 0x08, 0x40] {
+            let extended = try YDEbikeProtocol.authenticationPacket(
+                challenge: authenticationChallenge(flags: flags),
+                macAddress: "A1:B2:C3:D4:E5:F6",
+                hour: 10, minute: 20, second: 30
+            )
+            XCTAssertEqual(extended, original)
+        }
+    }
+
+    func testAuthenticationKeepsHighRandomBytesUnsigned() throws {
+        var challenge = authenticationChallenge(flags: 0x00)
+        challenge.replaceSubrange(0..<3, with: [0xF2, 0x80, 0xFF])
+        let packet = try YDEbikeProtocol.authenticationPacket(
+            challenge: challenge,
+            macAddress: "A1:B2:C3:D4:E5:F6",
+            hour: 10, minute: 20, second: 30
+        )
+        XCTAssertEqual(packet, Data([
+            0xFA, 0x94, 0xFF,
+            0x5B, 0x26, 0x3C,
+            0x2E, 0x71, 0x09,
+            0x41, 0x05, 0x01, 0x10, 0x55,
+        ]))
+    }
+
+    func testV2TokenChallengeCannotFallBackToLegacyAnswer() {
+        XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(
+            challenge: authenticationChallenge(flags: 0x58),
+            macAddress: "A1:B2:C3:D4:E5:F6",
+            hour: 10, minute: 20, second: 30
+        )) { error in
+            XCTAssertEqual(error as? YDEbikeProtocolError, .unsupportedTokenAuthentication)
+        }
+        // The date overload must enforce the same capability guard.
+        XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(
+            challenge: authenticationChallenge(flags: 0x59),
+            macAddress: "A1:B2:C3:D4:E5:F6",
+            date: Date(timeIntervalSince1970: 0)
+        )) { error in
+            XCTAssertEqual(error as? YDEbikeProtocolError, .unsupportedTokenAuthentication)
+        }
+    }
+
+    func testSecretKeyAndUnknownVersionsCannotFallBackToLegacyAnswer() {
+        for flags in [UInt8(0x10), 0x18] {
+            XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(
+                challenge: authenticationChallenge(flags: flags),
+                macAddress: "A1:B2:C3:D4:E5:F6",
+                hour: 10, minute: 20, second: 30
+            )) { error in
+                XCTAssertEqual(error as? YDEbikeProtocolError, .unsupportedSecretKeyAuthentication)
+            }
+        }
+        for flags in [UInt8(0x50), 0x60, 0x70] {
+            XCTAssertThrowsError(try YDEbikeProtocol.authenticationPacket(
+                challenge: authenticationChallenge(flags: flags),
+                macAddress: "A1:B2:C3:D4:E5:F6",
+                hour: 10, minute: 20, second: 30
+            )) { error in
+                XCTAssertEqual(error as? YDEbikeProtocolError, .unsupportedAuthenticationVersion(flags))
+            }
+        }
+    }
+
+    private func authenticationChallenge(flags: UInt8) -> Data {
+        var challenge = Data(repeating: 0, count: 16)
+        challenge.replaceSubrange(0..<3, with: [0x12, 0x34, 0x56])
+        challenge[13] = flags
+        return challenge
+    }
+
     func testControlPacketsAndChecksums() {
         let debug = [UInt8](YDEbikeProtocol.debugPacket())
         XCTAssertEqual(debug.count, 15)
@@ -161,3 +295,4 @@ final class YDEbikeProtocolTests: XCTestCase {
         XCTAssertTrue(merged.macCandidates.contains { $0.address == "A1:B2:C3:D4:E5:F6" })
     }
 }
+

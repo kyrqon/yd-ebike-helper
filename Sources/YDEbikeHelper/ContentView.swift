@@ -4,6 +4,7 @@ struct ContentView: View {
     @EnvironmentObject private var bluetooth: BLEManager
     @State private var selectedDeviceID: UUID?
     @State private var macAddress = ""
+    @State private var authenticationWriteMode: YDEbikeProtocol.AuthenticationWriteMode = .automatic
     @State private var customHex = ""
     @State private var pendingConfirmation: PendingConfirmation?
 
@@ -64,18 +65,37 @@ struct ContentView: View {
             Text("请确认车辆属于你或已获授权，并确保车辆完全停稳后再操作。")
         }
         .onChange(of: selectedDeviceID) { id in
+            macAddress = ""
             guard let id else {
-                macAddress = ""
                 return
             }
-            let saved = bluetooth.savedMACAddress(for: id)
-            if let systemAddress = bluetooth.systemMACAddress(for: id) {
-                macAddress = systemAddress
-            } else if let highConfidence = bluetooth.preferredMACCandidate(for: id) {
-                macAddress = highConfidence.address
-            } else {
-                macAddress = saved
+            loadSuggestedMAC(for: id)
+        }
+        .onChange(of: selectedDevice?.advertisement.macCandidates.first?.address) { _ in
+            if let selectedDeviceID {
+                loadSuggestedMAC(for: selectedDeviceID)
             }
+        }
+    }
+
+    private func loadSuggestedMAC(for id: UUID) {
+        guard macAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            let device = bluetooth.devices.first(where: { $0.id == id })
+        else { return }
+
+        let saved = bluetooth.savedMACAddress(for: id)
+        if !saved.isEmpty {
+            macAddress = saved
+            return
+        }
+
+        guard !device.isConnected, device.phase != .connecting, device.phase != .disconnecting
+        else { return }
+
+        if let systemAddress = bluetooth.systemMACAddress(for: id) {
+            macAddress = systemAddress
+        } else if let highConfidence = bluetooth.preferredMACCandidate(for: id) {
+            macAddress = highConfidence.address
         }
     }
 
@@ -209,7 +229,10 @@ struct ContentView: View {
     }
 
     private func connectionCard(_ device: DiscoveredDevice) -> some View {
-        GroupBox {
+        let editingDisabled = device.isConnected || device.phase == .connecting
+            || device.phase == .disconnecting
+
+        return GroupBox {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top, spacing: 14) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -219,7 +242,7 @@ struct ContentView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(.body.monospaced())
                             .frame(maxWidth: 280)
-                            .disabled(device.isConnected)
+                            .disabled(editingDisabled)
                         Text("设备名中的明确地址会自动填入；广播二进制中的候选请结合设备标签核对。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -242,7 +265,7 @@ struct ContentView: View {
                                             macAddress = candidate.address
                                         }
                                         .buttonStyle(.borderless)
-                                        .disabled(device.isConnected)
+                                        .disabled(editingDisabled)
                                     }
                                 }
                             }
@@ -252,21 +275,49 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         }
+
+                        Picker("认证写入方式", selection: $authenticationWriteMode) {
+                            ForEach(YDEbikeProtocol.AuthenticationWriteMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 360)
+                        .disabled(editingDisabled)
+
+                        Text("仅用于认证通信兼容，通常保持“自动（兼容）”。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if device.isConnected || device.phase == .ready {
-                        Button("断开连接", role: .destructive) {
-                            bluetooth.disconnect()
+                    VStack(alignment: .trailing, spacing: 8) {
+                        if device.isConnected || device.phase == .ready {
+                            Button("断开连接", role: .destructive) {
+                                bluetooth.disconnect()
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Button {
+                                bluetooth.connect(
+                                    to: device.id,
+                                    macAddress: macAddress,
+                                    writeMode: authenticationWriteMode
+                                )
+                            } label: {
+                                Label("连接并认证", systemImage: "link")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(
+                                editingDisabled
+                                    || macAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
                         }
-                        .buttonStyle(.bordered)
-                    } else {
-                        Button {
-                            bluetooth.connect(to: device.id, macAddress: macAddress)
-                        } label: {
-                            Label("连接并认证", systemImage: "link")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(device.phase == .connecting || device.phase == .disconnecting)
+
+                        Text(bluetooth.authenticationStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                            .frame(maxWidth: 240, alignment: .trailing)
                     }
                 }
             }
@@ -460,6 +511,10 @@ struct ContentView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 Spacer()
+                ShareLink(item: bluetooth.diagnosticReport) {
+                    Label("导出日志", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.plain)
                 Button("清空") {
                     bluetooth.clearLogs()
                 }
@@ -618,3 +673,4 @@ private struct LogRow: View {
         }
     }
 }
+

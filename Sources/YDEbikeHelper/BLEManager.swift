@@ -11,6 +11,7 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var deviceNamePrefix = "YD"
     @Published var minimumRSSI = -60
     @Published var lastError: String?
+    @Published private(set) var authenticationStatus = "尚未认证"
 
     let isDemoMode: Bool
     let demoScreen: String?
@@ -27,6 +28,46 @@ final class BLEManager: NSObject, ObservableObject {
     private var authenticationStarted = false
     private var authenticationReadScheduled = false
     private var authenticationCompleted = false
+    private var authenticationResponseStarted = false
+    private var activeAuthenticationWriteMode: YDEbikeProtocol.AuthenticationWriteMode = .automatic
+    private var connectionAttemptID = UUID()
+    private var connectionFailed = false
+    private var disconnectRequested = false
+    private var stageTimeoutWorkItem: DispatchWorkItem?
+    private var connectionStage = "未连接"
+    private let lastDiagnosticKey = "yd-last-failed-diagnostic-v1"
+
+    var diagnosticReport: String {
+        let current = currentDiagnosticReport
+        if !logs.contains(where: { $0.direction == .error }),
+            let previous = UserDefaults.standard.string(forKey: lastDiagnosticKey),
+            !previous.isEmpty
+        {
+            return current + "\n\n===== 上次失败记录 =====\n" + previous
+        }
+        return current
+    }
+
+    private var currentDiagnosticReport: String {
+        let formatter = ISO8601DateFormatter()
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "development"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "local"
+        let revision = Bundle.main.infoDictionary?["YDSourceRevision"] as? String ?? "local"
+        let entries = logs.map { entry in
+            let payload = entry.data.map { "\n  HEX: \($0.spacedHex)" } ?? ""
+            return "\(formatter.string(from: entry.timestamp)) [\(entry.direction.rawValue)] \(entry.message)\(payload)"
+        }
+        return ([
+            "YD E-Bike Helper / authentication-diagnostics-1",
+            "版本：\(version) (\(build))",
+            "源码：\(revision)",
+            "系统：\(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "阶段：\(connectionStage)",
+            "认证状态：\(authenticationStatus)",
+            "日志包含车辆地址与通信数据，分享前请核对。",
+            ""
+        ] + entries).joined(separator: "\n")
+    }
 
     private struct PendingWrite {
         let data: Data
@@ -37,6 +78,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     private var writeQueue: [PendingWrite] = []
     private var activeWrite: PendingWrite?
+    private var activeWriteRequiresResponse = false
 
     override init() {
         let arguments = ProcessInfo.processInfo.arguments
@@ -110,6 +152,9 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         if let peripheral = activePeripheral {
+            disconnectRequested = true
+            resetProtocolState()
+            authenticationStatus = "正在断开以重新扫描"
             updatePhase(.disconnecting, for: peripheral.identifier)
             central.cancelPeripheralConnection(peripheral)
         }
@@ -167,12 +212,18 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    func connect(to id: UUID, macAddress: String) {
+    func connect(
+        to id: UUID,
+        macAddress: String,
+        writeMode: YDEbikeProtocol.AuthenticationWriteMode = .automatic
+    ) {
         if isDemoMode {
             do {
-                let bestAddress = systemMACAddress(for: id)
-                    ?? preferredMACCandidate(for: id)?.address
-                    ?? macAddress
+                let bestAddress = try ConnectionMACSelection.resolve(
+                    userInput: macAddress,
+                    systemAddress: systemMACAddress(for: id),
+                    preferredCandidate: preferredMACCandidate(for: id)?.address
+                )
                 activeMACAddress = try saveMACAddress(bestAddress, for: id)
             } catch {
                 reportError(error.localizedDescription)
@@ -185,15 +236,25 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
 
+        guard central.state == .poweredOn else {
+            reportError(bluetoothState)
+            return
+        }
+        guard activePeripheral == nil else {
+            reportError("上次连接尚未断开，请等待断开完成后重试。")
+            return
+        }
         guard let peripheral = peripherals[id] else {
             reportError("设备已离开扫描范围，请刷新后重试。")
             return
         }
 
         do {
-            let bestAddress = systemMACAddress(for: id)
-                ?? preferredMACCandidate(for: id)?.address
-                ?? macAddress
+            let bestAddress = try ConnectionMACSelection.resolve(
+                userInput: macAddress,
+                systemAddress: systemMACAddress(for: id),
+                preferredCandidate: preferredMACCandidate(for: id)?.address
+            )
             activeMACAddress = try saveMACAddress(bestAddress, for: id)
         } catch {
             reportError(error.localizedDescription)
@@ -202,10 +263,18 @@ final class BLEManager: NSObject, ObservableObject {
 
         stopScan()
         resetProtocolState()
+        connectionAttemptID = UUID()
+        connectionFailed = false
+        disconnectRequested = false
+        lastError = nil
+        authenticationStatus = "等待建立蓝牙连接"
+        activeAuthenticationWriteMode = writeMode
         activePeripheral = peripheral
         connectedDeviceID = id
         updatePhase(.connecting, for: id)
         appendLog(.system, "连接 \(displayName(for: peripheral))，认证 MAC \(activeMACAddress ?? "")")
+        appendLog(.system, "认证写入方式：\(writeMode.title)；以本次输入的 MAC 为准")
+        setStage("建立蓝牙连接", timeout: 20)
         central.connect(peripheral, options: nil)
     }
 
@@ -220,6 +289,9 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         guard let peripheral = activePeripheral else { return }
+        disconnectRequested = true
+        resetProtocolState()
+        authenticationStatus = "正在断开"
         updatePhase(.disconnecting, for: peripheral.identifier)
         appendLog(.system, "正在断开 \(displayName(for: peripheral))")
         central.cancelPeripheralConnection(peripheral)
@@ -258,6 +330,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     func clearLogs() {
         logs.removeAll()
+        UserDefaults.standard.removeObject(forKey: lastDiagnosticKey)
     }
 
     private func sendCommand(_ data: Data, label: String) {
@@ -288,6 +361,8 @@ final class BLEManager: NSObject, ObservableObject {
 
         authenticationStarted = true
         updatePhase(.authenticating, for: peripheral.identifier)
+        authenticationStatus = "准备读取车辆认证能力"
+        setStage("订阅认证通知", timeout: 5)
         appendLog(.system, "服务已就绪，先订阅认证通知")
 
         if notify.isNotifying {
@@ -299,11 +374,15 @@ final class BLEManager: NSObject, ObservableObject {
             peripheral.setNotifyValue(true, for: notify)
 
             // 某些外设不会回调通知状态。超时后仍继续认证。
+            let attemptID = connectionAttemptID
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self, weak peripheral] in
                 guard
                     let self,
                     let peripheral,
                     self.activePeripheral === peripheral,
+                    self.connectionAttemptID == attemptID,
+                    !self.connectionFailed,
+                    !self.disconnectRequested,
                     let readWrite = self.authReadWriteCharacteristic
                 else {
                     return
@@ -414,12 +493,16 @@ final class BLEManager: NSObject, ObservableObject {
         guard !authenticationReadScheduled else { return }
         authenticationReadScheduled = true
         appendLog(.system, "认证通知就绪，等待 400 ms")
+        let attemptID = connectionAttemptID
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak peripheral] in
             guard
                 let self,
                 let peripheral,
-                self.activePeripheral === peripheral
+                self.activePeripheral === peripheral,
+                self.connectionAttemptID == attemptID,
+                !self.connectionFailed,
+                !self.disconnectRequested
             else {
                 return
             }
@@ -431,10 +514,19 @@ final class BLEManager: NSObject, ObservableObject {
                 guard
                     let self,
                     let peripheral,
-                    self.activePeripheral === peripheral
+                    self.activePeripheral === peripheral,
+                    self.connectionAttemptID == attemptID,
+                    !self.connectionFailed,
+                    !self.disconnectRequested
                 else {
                     return
                 }
+                guard characteristic.properties.contains(.read) else {
+                    self.failConnection("认证特征不支持 Read，不能读取挑战值。")
+                    return
+                }
+                self.setStage("读取认证挑战值", timeout: 8)
+                self.authenticationStatus = "正在读取车辆认证能力"
                 self.appendLog(.system, "读取认证挑战值")
                 peripheral.readValue(for: characteristic)
             }
@@ -442,8 +534,10 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private func authenticate(challenge: Data) {
+        guard !authenticationResponseStarted else { return }
+        authenticationResponseStarted = true
         guard
-            let peripheral = activePeripheral,
+            activePeripheral != nil,
             let macAddress = activeMACAddress,
             let characteristic = authReadWriteCharacteristic
         else {
@@ -452,6 +546,8 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         do {
+            let profile = try YDEbikeProtocol.authenticationProfile(challenge: challenge)
+            appendLog(.system, "认证能力：\(profile.diagnosticDescription)")
             let packet = try YDEbikeProtocol.authenticationPacket(
                 challenge: challenge,
                 macAddress: macAddress
@@ -464,8 +560,7 @@ final class BLEManager: NSObject, ObservableObject {
             )
             appendLog(.system, "已生成认证响应")
         } catch {
-            updatePhase(.failed, for: peripheral.identifier)
-            reportError(error.localizedDescription)
+            failConnection(error.localizedDescription)
         }
     }
 
@@ -496,19 +591,42 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         let next = writeQueue.removeFirst()
-        let writeType: CBCharacteristicWriteType = next.characteristic.properties.contains(.write)
-            ? .withResponse
-            : .withoutResponse
+        let properties = next.characteristic.properties
+        let usesResponse: Bool?
+        if next.completesAuthentication {
+            usesResponse = AuthenticationWriteSelection.usesResponse(
+                mode: activeAuthenticationWriteMode,
+                supportsResponse: properties.contains(.write),
+                supportsWithoutResponse: properties.contains(.writeWithoutResponse)
+            )
+        } else {
+            usesResponse = properties.contains(.write) ? true
+                : (properties.contains(.writeWithoutResponse) ? false : nil)
+        }
+        guard let usesResponse else {
+            let message = "\(next.label)：特征不支持所选写入方式（properties=0x\(String(properties.rawValue, radix: 16))）。"
+            if next.completesAuthentication { failConnection(message) }
+            else { reportError(message); drainWriteQueue() }
+            return
+        }
+        let writeType: CBCharacteristicWriteType = usesResponse ? .withResponse : .withoutResponse
         let maximum = peripheral.maximumWriteValueLength(for: writeType)
         guard next.data.count <= maximum else {
-            reportError(
-                "\(next.label) 共 \(next.data.count) 字节，超过当前链路单次写入上限 \(maximum) 字节。"
-            )
-            drainWriteQueue()
+            let message = "\(next.label) 共 \(next.data.count) 字节，超过当前链路单次写入上限 \(maximum) 字节。"
+            if next.completesAuthentication { failConnection(message) }
+            else { reportError(message); drainWriteQueue() }
             return
         }
 
+        if !usesResponse && !peripheral.canSendWriteWithoutResponse {
+            writeQueue.insert(next, at: 0)
+            setStage("等待蓝牙写入队列", timeout: 8)
+            return
+        }
         activeWrite = next
+        activeWriteRequiresResponse = usesResponse
+        setStage(next.completesAuthentication ? "写入认证应答" : "写入\(next.label)", timeout: 8)
+        appendLog(.system, "\(next.label)使用 \(usesResponse ? "Write Request" : "Write Without Response")")
         appendLog(.sent, next.label, data: next.data)
         peripheral.writeValue(next.data, for: next.characteristic, type: writeType)
 
@@ -519,16 +637,25 @@ final class BLEManager: NSObject, ObservableObject {
 
     private func finishActiveWrite(error: Error?) {
         guard let write = activeWrite else { return }
+        let requiresResponse = activeWriteRequiresResponse
         activeWrite = nil
+        stageTimeoutWorkItem?.cancel()
+        stageTimeoutWorkItem = nil
 
         if let error {
-            reportError("\(write.label)写入失败：\(error.localizedDescription)")
+            let message = "\(write.label)写入失败：\(errorDescription(error))"
+            if write.completesAuthentication { failConnection(message) }
+            else { reportError(message) }
         } else {
-            appendLog(.system, "\(write.label)写入成功")
+            appendLog(.system, requiresResponse
+                ? "\(write.label)已获得 GATT 写确认；不等于车辆业务认证成功"
+                : "\(write.label)已提交蓝牙发送队列；Write Without Response 没有车端写确认")
             if write.completesAuthentication, let peripheral = activePeripheral {
                 authenticationCompleted = true
                 updatePhase(.ready, for: peripheral.identifier)
-                appendLog(.system, "认证响应已写入，设备可开始调试")
+                authenticationStatus = "旧版认证应答已提交，车端结果尚未验证"
+                setStage("旧版应答已提交")
+                appendLog(.system, authenticationStatus)
                 peripheral.readRSSI()
             }
         }
@@ -536,6 +663,8 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private func resetProtocolState() {
+        stageTimeoutWorkItem?.cancel()
+        stageTimeoutWorkItem = nil
         authReadWriteCharacteristic = nil
         authNotifyCharacteristic = nil
         commandWriteCharacteristic = nil
@@ -543,8 +672,44 @@ final class BLEManager: NSObject, ObservableObject {
         authenticationStarted = false
         authenticationReadScheduled = false
         authenticationCompleted = false
+        authenticationResponseStarted = false
         writeQueue.removeAll()
         activeWrite = nil
+    }
+
+    private func setStage(_ stage: String, timeout: TimeInterval? = nil) {
+        stageTimeoutWorkItem?.cancel()
+        stageTimeoutWorkItem = nil
+        connectionStage = stage
+        appendLog(.system, "阶段：\(stage)")
+        guard let timeout else { return }
+        let attemptID = connectionAttemptID
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                self.connectionAttemptID == attemptID,
+                self.activePeripheral != nil,
+                !self.connectionFailed,
+                !self.disconnectRequested
+            else { return }
+            self.failConnection("等待「\(stage)」超过 \(Int(timeout)) 秒，已断开。")
+        }
+        stageTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: workItem)
+    }
+
+    private func failConnection(_ message: String) {
+        connectionFailed = true
+        authenticationStatus = "失败阶段：\(connectionStage)"
+        reportError("[\(connectionStage)] \(message)")
+        resetProtocolState()
+        if let peripheral = activePeripheral {
+            updatePhase(.failed, for: peripheral.identifier)
+            central.cancelPeripheralConnection(peripheral)
+        }
+    }
+
+    private func acceptsCallbacks(from peripheral: CBPeripheral) -> Bool {
+        activePeripheral === peripheral && !connectionFailed && !disconnectRequested
     }
 
     private func updateDevice(
@@ -638,16 +803,36 @@ final class BLEManager: NSObject, ObservableObject {
     private func reportError(_ message: String) {
         lastError = message
         appendLog(.error, message)
+        UserDefaults.standard.set(currentDiagnosticReport, forKey: lastDiagnosticKey)
     }
 
     private func errorDescription(_ error: Error) -> String {
         let nsError = error as NSError
-        return "\(error.localizedDescription) [\(nsError.domain):\(nsError.code)]"
+        let reason = nsError.localizedFailureReason.map { "；\($0)" } ?? ""
+        let underlying = (nsError.userInfo[NSUnderlyingErrorKey] as? NSError)
+            .map { "；底层 \($0.domain):\($0.code) \($0.localizedDescription)" } ?? ""
+        return "\(error.localizedDescription) [\(nsError.domain):\(nsError.code)]\(reason)\(underlying)"
     }
 }
 
 extension BLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state != .poweredOn {
+            if activePeripheral != nil && !disconnectRequested {
+                authenticationStatus = "蓝牙状态变化，连接已失效"
+                reportError("[\(connectionStage)] 蓝牙连接不可用，请恢复蓝牙后重新扫描。")
+            }
+            connectionAttemptID = UUID()
+            resetProtocolState()
+            scanStopWorkItem?.cancel()
+            scanStopWorkItem = nil
+            activePeripheral = nil
+            connectedDeviceID = nil
+            activeMACAddress = nil
+            peripherals.removeAll()
+            devices.removeAll()
+            isScanning = false
+        }
         switch central.state {
         case .poweredOn:
             bluetoothState = "蓝牙已开启"
@@ -718,13 +903,15 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard acceptsCallbacks(from: peripheral) else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         if let systemAddress = PeripheralAddressResolver.address(for: peripheral) {
-            activeMACAddress = systemAddress
-            _ = try? saveMACAddress(systemAddress, for: peripheral.identifier)
             updateSystemAddress(systemAddress, for: peripheral.identifier)
             appendLog(
                 .system,
-                "系统读取到 BDAddress \(systemAddress)，将覆盖广播候选用于认证"
+                "系统读取到 BDAddress \(systemAddress)；保留本次输入的认证 MAC \(activeMACAddress ?? "")"
             )
         } else {
             appendLog(
@@ -734,6 +921,8 @@ extension BLEManager: CBCentralManagerDelegate {
         }
         appendLog(.system, "已连接 \(displayName(for: peripheral))，开始发现 GATT 服务")
         updatePhase(.discovering, for: peripheral.identifier)
+        authenticationStatus = "蓝牙已连接，正在发现认证服务"
+        setStage("发现 GATT 服务与特征", timeout: 10)
         peripheral.delegate = self
         peripheral.discoverServices([
             CBUUID(string: YDEbikeProtocol.authenticationService),
@@ -746,9 +935,12 @@ extension BLEManager: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard activePeripheral === peripheral else { return }
+        connectionFailed = true
+        authenticationStatus = "蓝牙连接失败"
         updatePhase(.failed, for: peripheral.identifier)
         reportError(
-            "连接失败：\(error.map(errorDescription) ?? "请将设备重新上电后重试")"
+            "[\(connectionStage)] 连接失败：\(error.map(errorDescription) ?? "请将设备重新上电后重试")"
         )
         activePeripheral = nil
         connectedDeviceID = nil
@@ -760,8 +952,10 @@ extension BLEManager: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard activePeripheral === peripheral else { return }
         let disconnectedDuringAuthentication = authenticationStarted && !authenticationCompleted
-        updatePhase(.discovered, for: peripheral.identifier)
+        let unexpected = !disconnectRequested && !connectionFailed
+        updatePhase(connectionFailed || unexpected ? .failed : .discovered, for: peripheral.identifier)
         appendLog(
             error == nil ? .system : .error,
             error == nil
@@ -771,8 +965,14 @@ extension BLEManager: CBCentralManagerDelegate {
         if disconnectedDuringAuthentication {
             appendLog(
                 .error,
-                "认证完成前断线：请关闭曾连接该设备的 iPhone 蓝牙/控制 App，重新给设备上电后再试。"
+                "认证完成前断线，最后阶段：\(connectionStage)。请导出日志以区分读取挑战值、订阅通知与写入应答。"
             )
+        }
+        if unexpected {
+            authenticationStatus = "连接已中断，最后阶段：\(connectionStage)"
+            reportError("[\(connectionStage)] 连接中断：\(error.map(errorDescription) ?? "车辆关闭了连接，系统未提供原因")")
+        } else if disconnectRequested {
+            authenticationStatus = "已断开"
         }
         activePeripheral = nil
         connectedDeviceID = nil
@@ -783,14 +983,22 @@ extension BLEManager: CBCentralManagerDelegate {
 
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard acceptsCallbacks(from: peripheral) else { return }
         if let error {
-            reportError("发现服务失败：\(error.localizedDescription)")
+            failConnection("发现服务失败：\(errorDescription(error))")
             return
         }
 
         let services = peripheral.services ?? []
         appendLog(.system, "发现 \(services.count) 个目标服务")
+        let found = Set(services.map { $0.uuid.uuidString.uppercased() })
+        let required = [YDEbikeProtocol.authenticationService, YDEbikeProtocol.commandService]
+        guard required.allSatisfy({ found.contains($0) }) else {
+            failConnection("缺少本协议所需服务；实际返回：\(found.sorted().joined(separator: ", "))")
+            return
+        }
         for service in services {
+            appendLog(.system, "服务 \(service.uuid.uuidString)")
             switch service.uuid.uuidString.uppercased() {
             case YDEbikeProtocol.authenticationService:
                 peripheral.discoverCharacteristics([
@@ -813,12 +1021,14 @@ extension BLEManager: CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
+        guard acceptsCallbacks(from: peripheral) else { return }
         if let error {
-            reportError("发现特征失败：\(error.localizedDescription)")
+            failConnection("发现特征失败：\(errorDescription(error))")
             return
         }
 
         for characteristic in service.characteristics ?? [] {
+            appendLog(.system, "特征 \(characteristic.uuid.uuidString)，properties=0x\(String(characteristic.properties.rawValue, radix: 16)) \(characteristicProperties(characteristic.properties))")
             switch characteristic.uuid.uuidString.uppercased() {
             case YDEbikeProtocol.authenticationReadWriteCharacteristic:
                 authReadWriteCharacteristic = characteristic
@@ -834,6 +1044,23 @@ extension BLEManager: CBPeripheralDelegate {
             appendLog(.system, "特征 \(characteristic.uuid.uuidString) 已发现")
         }
 
+        if service.uuid.uuidString.uppercased() == YDEbikeProtocol.authenticationService,
+            (authReadWriteCharacteristic == nil || authNotifyCharacteristic == nil)
+        {
+            failConnection("认证服务缺少 Read/Write 或 Notify 特征。")
+            return
+        }
+        if service.uuid.uuidString.uppercased() == YDEbikeProtocol.commandService {
+            guard commandWriteCharacteristic != nil else {
+                failConnection("命令服务缺少写入特征。")
+                return
+            }
+            if let notify = commandNotifyCharacteristic,
+                notify.properties.contains(.notify) || notify.properties.contains(.indicate)
+            {
+                peripheral.setNotifyValue(true, for: notify)
+            }
+        }
         beginAuthenticationIfPossible()
     }
 
@@ -842,8 +1069,9 @@ extension BLEManager: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard acceptsCallbacks(from: peripheral) else { return }
         if let error {
-            reportError("读取 \(characteristic.uuid.uuidString) 失败：\(error.localizedDescription)")
+            failConnection("读取 \(characteristic.uuid.uuidString) 失败：\(errorDescription(error))")
             return
         }
         guard let data = characteristic.value else { return }
@@ -851,9 +1079,11 @@ extension BLEManager: CBPeripheralDelegate {
         appendLog(.received, characteristic.uuid.uuidString, data: data)
         switch characteristic.uuid.uuidString.uppercased() {
         case YDEbikeProtocol.authenticationReadWriteCharacteristic:
-            if !authenticationCompleted {
+            if authenticationStarted && !authenticationCompleted {
                 authenticate(challenge: data)
             }
+        case YDEbikeProtocol.authenticationNotifyCharacteristic:
+            appendLog(.system, "已收到认证通知，原始内容已记录；当前旧版流程不把该通知自动判为认证成功")
         case YDEbikeProtocol.commandNotifyCharacteristic:
             if let code = YDEbikeProtocol.commandResponseCode(from: data) {
                 appendLog(
@@ -871,6 +1101,10 @@ extension BLEManager: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard acceptsCallbacks(from: peripheral),
+            activeWriteRequiresResponse,
+            activeWrite?.characteristic === characteristic
+        else { return }
         finishActiveWrite(error: error)
     }
 
@@ -879,10 +1113,11 @@ extension BLEManager: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard acceptsCallbacks(from: peripheral) else { return }
         if let error {
             appendLog(
                 .error,
-                "订阅 \(characteristic.uuid.uuidString) 失败：\(errorDescription(error))"
+                "[\(connectionStage)] 订阅 \(characteristic.uuid.uuidString) 失败：\(errorDescription(error))"
             )
         } else {
             appendLog(.system, "已订阅通知 \(characteristic.uuid.uuidString)")
@@ -890,6 +1125,7 @@ extension BLEManager: CBPeripheralDelegate {
 
         if characteristic.uuid.uuidString.uppercased()
             == YDEbikeProtocol.authenticationNotifyCharacteristic,
+            authenticationStarted,
             let readWrite = authReadWriteCharacteristic
         {
             // 即使订阅失败也继续认证，因此这里不因 error 提前退出。
@@ -901,10 +1137,26 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        guard acceptsCallbacks(from: peripheral) else { return }
         guard error == nil else { return }
         if let index = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
             devices[index].rssi = RSSI.intValue
             devices = devices
         }
     }
+
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        guard acceptsCallbacks(from: peripheral) else { return }
+        drainWriteQueue()
+    }
+
+    private func characteristicProperties(_ properties: CBCharacteristicProperties) -> String {
+        let labels: [(CBCharacteristicProperties, String)] = [
+            (.read, "Read"), (.write, "Write"),
+            (.writeWithoutResponse, "WriteWithoutResponse"),
+            (.notify, "Notify"), (.indicate, "Indicate")
+        ]
+        return labels.filter { properties.contains($0.0) }.map { $0.1 }.joined(separator: "/")
+    }
 }
+

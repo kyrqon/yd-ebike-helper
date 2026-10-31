@@ -1,5 +1,21 @@
 # YD E-Bike Helper
 
+## 此 fork 的认证诊断改动
+
+- 本次选择或输入的 MAC 优先，扫描更新及连接回调不会覆盖它。
+- 认证写入支持“自动（兼容）”“需要确认”“无需确认”。自动模式在特征支持时使用 Write Without Response，否则使用 Write Request；手动指定的方式不受支持时明确报错，不静默切换。
+- 记录服务、特征属性、实际认证 MAC、读写阶段、超时以及完整蓝牙错误域与错误码。日志页支持导出，最近一次失败记录保存在本机，重开 App 后也会包含在导出文本中；“清空”会同时删除该记录。日志含车辆地址和通信数据，分享前请核对。
+- 参考 [YuRong 的认证能力分析](https://github.com/ghhccghk/YuRong/blob/0df37d80fa747c1c55de278bfa487e5db71e7af6/shared/src/commonMain/kotlin/top/ghhccghk/yadea/vehicle/VehicleHandshakeFrame.kt)独立实现 RandKey 版本识别。这是社区代码的观测规则，仍需目标车辆验证。识别到 V2 Token、SecretKey、未知版本或未知长度时停止旧版应答，并给出原因；此 fork 没有接入云端凭证或密钥流程。
+- 保留原有 14 字节旧版认证应答算法。旧版显示“应答已提交”只表示蓝牙写入已完成或已排入发送队列，不代表车端认证或控制指令已获确认。
+
+此版本用于排查连接与认证兼容性。尚未验证雅迪 Q17 Pro Y 的认证兼容性或解除限速效果，原有车辆控制报文没有新增或改写。
+
+### Windows 用户构建与测试
+
+在 Actions 中运行 **Build iPhone IPA**，选择本次修改的分支。工作流先执行 swift test，再编译该分支的准确提交，输出 YDEbikeHelper-auth-diagnostics-unsigned.ipa 和 SHA-256。IPA 需要在 Windows 上通过 Sideloadly 等工具本地签名后安装。
+
+实车排查时先使用“自动（兼容）”，只点击“连接并认证”。失败后先从“通信日志”导出日志；若日志显示应答写入或断线问题，可断开后改用“需要确认”做一次对照。切换方式不会修改认证算法，不能解决当前未支持的 Token / SecretKey 流程。
+
 <p align="center">
   <img src="Assets/AppIcon.png" width="160" alt="YD E-Bike Helper 图标">
 </p>
@@ -103,3 +119,4 @@ xcodebuild \
 - 请勿在车辆行驶过程中连接或发送控制指令。
 - 不同车型和固件版本的兼容性可能存在差异。
 - 本工具不提供绕过车辆安全机制、所有权验证或访问控制的功能。
+
