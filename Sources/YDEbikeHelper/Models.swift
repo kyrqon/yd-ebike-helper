@@ -1,5 +1,142 @@
 import Foundation
 
+struct OperationNotice: Equatable {
+    let title: String
+    let message: String
+}
+
+/// A state report may arrive before the GATT write callback. Both are needed
+/// before showing a one-shot notice; this does not turn telemetry into an ACK.
+struct OperationFeedback {
+    private struct Pending {
+        let id: UUID
+        let label: String
+        let expectedValue: Int
+        var writeConfirmed = false
+        var reportedValue: Int?
+    }
+    private var pending: Pending?
+    var pendingID: UUID? { pending?.id }
+
+    mutating func begin(label: String, expectedValue: Int) {
+        pending = Pending(id: UUID(), label: label, expectedValue: expectedValue)
+    }
+
+    mutating func recordWriteConfirmation() -> OperationNotice? {
+        pending?.writeConfirmed = true
+        return consumeMatchingState()
+    }
+
+    mutating func recordState(_ value: Int) -> OperationNotice? {
+        guard (0...2).contains(value) else { return nil }
+        pending?.reportedValue = value
+        return consumeMatchingState()
+    }
+
+    mutating func timeout(id: UUID) -> OperationNotice? {
+        guard let current = pending, current.id == id, current.writeConfirmed else { return nil }
+        pending = nil
+        return OperationNotice(
+            title: "指令已发送",
+            message: "「\(current.label)」已取得蓝牙写确认，暂未收到可确认的目标状态反馈。请核对车辆实际表现。"
+        )
+    }
+
+    mutating func reset() { pending = nil }
+
+    private mutating func consumeMatchingState() -> OperationNotice? {
+        guard let current = pending, current.writeConfirmed,
+            current.reportedValue == current.expectedValue
+        else { return nil }
+        pending = nil
+        return OperationNotice(
+            title: "车辆状态已确认",
+            message: "已收到与「\(current.label)」请求一致的车辆状态反馈。"
+        )
+    }
+}
+
+/// Sample only routine telemetry. Authentication, short state changes, errors,
+/// and actual command writes must never be dropped by this filter.
+struct PeriodicStatusLogSampler {
+    struct Decision: Equatable {
+        let shouldLog: Bool
+        let suppressed: Int
+    }
+    private struct Sample {
+        var lastLogged: Date
+        var suppressed = 0
+    }
+    private var samples: [UInt8: Sample] = [:]
+    let interval: TimeInterval
+
+    init(interval: TimeInterval = 15) { self.interval = interval }
+
+    mutating func accept(frameType: UInt8?, now: Date) -> Decision {
+        guard let frameType, frameType == 0x2A || frameType == 0x2B else {
+            return Decision(shouldLog: true, suppressed: 0)
+        }
+        guard var sample = samples[frameType] else {
+            samples[frameType] = Sample(lastLogged: now)
+            return Decision(shouldLog: true, suppressed: 0)
+        }
+        let elapsed = now.timeIntervalSince(sample.lastLogged)
+        if elapsed >= interval || elapsed < 0 {
+            samples[frameType] = Sample(lastLogged: now)
+            return Decision(shouldLog: true, suppressed: sample.suppressed)
+        }
+        sample.suppressed += 1
+        samples[frameType] = sample
+        return Decision(shouldLog: false, suppressed: 0)
+    }
+
+    mutating func flush() -> Int {
+        let count = samples.values.reduce(0) { $0 + $1.suppressed }
+        samples.removeAll()
+        return count
+    }
+}
+
+/// Explicit user input must survive advertisement updates and system suggestions.
+enum ConnectionMACSelection {
+    static func resolve(
+        userInput: String,
+        systemAddress: String?,
+        preferredCandidate: String?
+    ) throws -> String {
+        let entered = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !entered.isEmpty {
+            return try YDEbikeProtocol.normalizedMAC(entered)
+        }
+        for suggestion in [systemAddress, preferredCandidate] {
+            if let suggestion,
+                let normalized = try? YDEbikeProtocol.normalizedMAC(suggestion)
+            {
+                return normalized
+            }
+        }
+        throw YDEbikeProtocolError.invalidMACAddress
+    }
+}
+
+enum AuthenticationWriteSelection {
+    static func usesResponse(
+        mode: YDEbikeProtocol.AuthenticationWriteMode,
+        supportsResponse: Bool,
+        supportsWithoutResponse: Bool
+    ) -> Bool? {
+        switch mode {
+        case .automatic:
+            if supportsWithoutResponse { return false }
+            return supportsResponse ? true : nil
+        case .withResponse:
+            return supportsResponse ? true : nil
+        case .withoutResponse:
+            return supportsWithoutResponse ? false : nil
+        }
+    }
+}
+
 enum DeviceConnectionPhase: String, Codable {
     case discovered
     case connecting
@@ -354,3 +491,4 @@ extension Data {
         map { String(format: "%02X", $0) }.joined(separator: " ")
     }
 }
+

@@ -3,6 +3,10 @@ import Foundation
 enum YDEbikeProtocolError: LocalizedError, Equatable {
     case invalidMACAddress
     case challengeTooShort
+    case unsupportedChallengeLength(Int)
+    case unsupportedTokenAuthentication
+    case unsupportedSecretKeyAuthentication
+    case unsupportedAuthenticationVersion(UInt8)
     case invalidHex
 
     var errorDescription: String? {
@@ -11,6 +15,14 @@ enum YDEbikeProtocolError: LocalizedError, Equatable {
             return "MAC 地址必须包含 12 个十六进制字符，例如 A1:B2:C3:D4:E5:F6。"
         case .challengeTooShort:
             return "认证挑战值少于 3 字节。"
+        case .unsupportedChallengeLength(let count):
+            return "认证挑战值为 \(count) 字节：当前仅识别 3 字节旧版随机数或 16 字节 RandKey，已停止认证。"
+        case .unsupportedTokenAuthentication:
+            return "设备使用 V2 Token 鉴权，不能发送旧版应答。请先登录雅迪账号并选择本人绑定车辆。"
+        case .unsupportedSecretKeyAuthentication:
+            return "设备的认证能力标志指向 SecretKey 流程，当前版本不支持，已停止发送旧版认证应答。"
+        case .unsupportedAuthenticationVersion(let flags):
+            return "设备返回尚未支持的认证版本标志（\(String(format: "0x%02X", Int(flags)))），已停止发送旧版认证应答。"
         case .invalidHex:
             return "HEX 数据格式无效，请输入成对的十六进制字符。"
         }
@@ -18,6 +30,73 @@ enum YDEbikeProtocolError: LocalizedError, Equatable {
 }
 
 enum YDEbikeProtocol {
+    enum AuthenticationWriteMode: String, CaseIterable, Identifiable {
+        case automatic
+        case withResponse
+        case withoutResponse
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .automatic: return "自动（兼容）"
+            case .withResponse: return "需要确认"
+            case .withoutResponse: return "无需确认"
+            }
+        }
+    }
+
+    enum AuthenticationFlow: Equatable {
+        case legacy
+        case tokenV2
+        case secretKey
+        case unsupportedVersion
+    }
+
+    struct AuthenticationProfile: Equatable {
+        let challengeLength: Int
+        let rawFlags: UInt8?
+
+        // Observed RandKey layout documented by ghhccghk/YuRong, not a
+        // manufacturer specification or a model compatibility guarantee.
+        var tokenAuth: Bool { rawFlags.map { $0 & 0x08 != 0 } ?? false }
+        var versionSelector: UInt8? { rawFlags.map { ($0 >> 4) & 0x03 } }
+        var authVersion2: Bool { versionSelector == 1 }
+
+        // YuRong tests bit 6 inversely in its V2 branch. A clear bit alone
+        // is not enough to infer SecretKey requirements for legacy devices.
+        var requiresSecretKey: Bool {
+            guard authVersion2, let rawFlags else { return false }
+            return rawFlags & 0x40 == 0
+        }
+
+        var flow: AuthenticationFlow {
+            guard let versionSelector else { return .legacy }
+            switch versionSelector {
+            case 0: return .legacy
+            case 1:
+                if requiresSecretKey { return .secretKey }
+                return tokenAuth ? .tokenV2 : .unsupportedVersion
+            default: return .unsupportedVersion
+            }
+        }
+
+        var diagnosticDescription: String {
+            guard let rawFlags else {
+                return "3 字节随机数：没有版本标志，保留原有旧版应答；协议版本未经确认"
+            }
+            let flags = String(format: "0x%02X", Int(rawFlags))
+            let description: String
+            switch flow {
+            case .legacy: description = "旧版认证候选，兼容性仍需实车确认"
+            case .tokenV2: description = "V2 Token 鉴权，需要本人账号及车辆授权"
+            case .secretKey: description = "V2 SecretKey 流程，当前不支持"
+            case .unsupportedVersion: description = "尚未支持的认证版本"
+            }
+            return "RandKey \(challengeLength) 字节，flags=\(flags)，\(description)"
+        }
+    }
+
     static let authenticationService = "E7810B92-73AE-499D-8C15-FAA9AEF0C3F2"
     static let authenticationReadWriteCharacteristic = "BEF8E7E0-9C21-4C9E-B632-BD58C1009F9F"
     static let authenticationNotifyCharacteristic = "BEF8E7E1-9C21-4C9E-B632-BD58C1009F9F"
@@ -47,9 +126,7 @@ enum YDEbikeProtocol {
         minute: Int,
         second: Int
     ) throws -> Data {
-        guard challenge.count >= 3 else {
-            throw YDEbikeProtocolError.challengeTooShort
-        }
+        _ = try requireLegacyAuthentication(challenge: challenge)
 
         let normalized = try normalizedMAC(macAddress)
         let compactMAC = normalized.replacingOccurrences(of: ":", with: "")
@@ -73,6 +150,36 @@ enum YDEbikeProtocol {
                 + bytes24(secondKey)
                 + [0x41, 0x05, 0x01, 0x10, 0x55]
         )
+    }
+
+    static func authenticationProfile(challenge: Data) throws -> AuthenticationProfile {
+        guard challenge.count >= 3 else {
+            throw YDEbikeProtocolError.challengeTooShort
+        }
+        // Preserve the original three-byte input contract. Other shortened
+        // reads must not silently discard the version flags of a RandKey.
+        guard challenge.count == 3 || challenge.count == 16 else {
+            throw YDEbikeProtocolError.unsupportedChallengeLength(challenge.count)
+        }
+        let bytes = [UInt8](challenge)
+        return AuthenticationProfile(
+            challengeLength: bytes.count,
+            rawFlags: bytes.count == 16 ? bytes[13] : nil
+        )
+    }
+
+    static func requireLegacyAuthentication(challenge: Data) throws -> AuthenticationProfile {
+        let profile = try authenticationProfile(challenge: challenge)
+        switch profile.flow {
+        case .legacy:
+            return profile
+        case .tokenV2:
+            throw YDEbikeProtocolError.unsupportedTokenAuthentication
+        case .secretKey:
+            throw YDEbikeProtocolError.unsupportedSecretKeyAuthentication
+        case .unsupportedVersion:
+            throw YDEbikeProtocolError.unsupportedAuthenticationVersion(profile.rawFlags ?? 0)
+        }
     }
 
     static func authenticationPacket(
@@ -120,12 +227,24 @@ enum YDEbikeProtocol {
         return checksummed(packet)
     }
 
-    static func commandResponseCode(from data: Data) -> Int? {
+    /// Complete, checksum-valid status frames. These are telemetry, not command ACKs.
+    static func vehicleStatusFrameType(from data: Data) -> UInt8? {
         let bytes = [UInt8](data)
-        guard bytes.count >= 40, bytes[2] == 0x2A else {
-            return nil
-        }
-        return Int((bytes[39] >> 3) & 0x03)
+        guard bytes.count >= 7, bytes[0] == 0x59, bytes[1] == 0x44,
+            [UInt8(0x29), 0x2A, 0x2B].contains(bytes[2]),
+            bytes.count == Int(bytes[3]) + 7,
+            bytes[bytes.count - 2] == 0x4B, bytes.last == 0x4A
+        else { return nil }
+        let checksumIndex = bytes.count - 3
+        let sum = bytes[2..<checksumIndex].reduce(UInt8(0)) { $0 &+ $1 }
+        return sum == bytes[checksumIndex] ? bytes[2] : nil
+    }
+
+    /// Observed short status field, not a per-command execution result.
+    static func shortReportedState(from data: Data) -> Int? {
+        guard vehicleStatusFrameType(from: data) == 0x29, data.count >= 9 else { return nil }
+        let raw = Int([UInt8](data)[5] & 0x03)
+        return raw == 3 ? nil : raw
     }
 
     static func parseHex(_ input: String) throws -> Data {
@@ -175,3 +294,4 @@ enum YDEbikeProtocol {
         return Data(packet)
     }
 }
+

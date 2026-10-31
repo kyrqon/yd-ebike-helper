@@ -4,102 +4,103 @@
   <img src="Assets/AppIcon.png" width="160" alt="YD E-Bike Helper 图标">
 </p>
 
-`YD E-Bike Helper` 是一款适用于 macOS 和 iPhone 的雅迪（YADEA）电动车 BLE 蓝牙调试工具，可用于发现设备、建立连接、完成设备认证、管理动力锁定以及查看通信日志。
+适用于 macOS 和 iPhone 的雅迪（YADEA）电动车 BLE 调试工具，提供设备发现、账号与车辆管理、蓝牙认证、动力锁定控制和通信日志。
 
-[软件主页](https://cbdt-jwt.github.io/yd-ebike-helper/) · [下载最新版](https://github.com/CBDT-JWT/yd-ebike-helper/releases/latest)
+> 本项目为非官方工具，与雅迪科技集团有限公司无隶属或授权关系。请仅连接本人拥有或已获授权的车辆。
 
-> 本项目是独立开发的非官方工具，与雅迪科技集团有限公司无隶属或授权关系。请仅连接和调试属于自己或已获得明确授权的设备。
+## 功能
 
-## 主要功能
+- 扫描 BLE 设备，查看名称、信号强度、广播与 GATT 信息。
+- 从广播识别 MAC 候选，也支持手动输入；连接时保留用户选择的地址。
+- 实现旧版认证和 V2 Token 握手。V2 使用本人账号下绑定车辆的授权材料，并检查车端认证结果。
+- 通过验证码或密码登录账号，刷新并选择绑定车辆；车辆 MAC 必须与当前蓝牙目标一致。
+- 解除或恢复兼容车辆的动力锁定，调整提示音音量，发送自定义 HEX。
+- 区分 GATT 写确认、车辆认证结果和状态反馈，动力操作状态匹配时显示一次提示。
+- 导出通信日志、保留最近失败记录，并对周期状态通知采样，减少重复日志。
 
-- 扫描附近名称以 `YD` 开头的 BLE 设备
-- 展示设备名称、信号强度、系统标识和广播数据
-- 从设备广播信息中识别 MAC 地址，也支持手动输入
-- 连接设备并完成认证流程
-- 解除或恢复兼容车辆的动力锁定
-- 设置提示音音量，并支持发送自定义 HEX 数据
-- 查看 GATT 服务、特征及收发日志
+不同车型、控制器和固件的协议可能不同。SecretKey 刷写及未知认证格式尚未实现，遇到这些流程会停止并显示原因。
 
 ## 系统要求
 
-### iPhone
+- **iPhone**：iOS 17 或更高版本，支持蓝牙。
+- **macOS**：macOS 13 或更高版本，支持蓝牙。
+- **源码构建**：Xcode 15 或更高版本；Swift Package 使用 Swift 5.10 或更高版本。
 
-- iOS 17 或更高版本
-- 一台安装了 Xcode 15 或更高版本的 Mac
-- 普通 Apple 账户即可进行免费真机签名
-
-### Mac
-
-- macOS 13 Ventura 或更高版本
-- 支持蓝牙的 Mac
-- Apple Silicon 或 Intel 处理器
+车辆 BLE 通信必须在真机上验证，模拟器不能代替实车蓝牙连接。
 
 ## 安装到 iPhone
 
-iPhone 版本不需要 TestFlight，可以通过 Xcode 直接安装到自己的手机。
+### 使用 Mac 与 Xcode
 
-1. 使用 Xcode 打开 `YDEbikeHelper.xcodeproj`。
-2. 打开“Xcode → Settings → Accounts”，登录你的 Apple 账户。
-3. 用数据线连接 iPhone，在手机上选择“信任此电脑”。
-4. 在项目导航中选择 `YDEbikeHelper`，再选择 `YDEbikeHelper-iOS` Target。
-5. 打开“Signing & Capabilities”，将 Team 设为你的 `Personal Team`。
-6. 如果 Bundle Identifier 出现重复提示，将其修改成只属于你的值，例如 `com.yourname.ydebikehelper`。
-7. 在 Xcode 顶部运行设备中选择你的 iPhone，然后点击运行按钮或按 `Command + R`。
-8. 如果手机提示需要开发者模式，前往“设置 → 隐私与安全性 → 开发者模式”，开启并按提示重新启动手机。
-9. 首次打开 App 时允许使用蓝牙。
+1. 打开 `YDEbikeHelper.xcodeproj`。
+2. 在 Xcode 的 Accounts 中登录 Apple 账户。
+3. 用数据线连接 iPhone，解锁并信任电脑。
+4. 选择 `YDEbikeHelper-iOS` Target，在 Signing & Capabilities 中设置自己的 Team；如有需要，修改 Bundle Identifier。
+5. 选择连接的 iPhone 并运行。
+6. 如系统要求，开启 iPhone 的开发者模式并按提示重启；首次启动时允许蓝牙权限。
 
-免费 `Personal Team` 筿名有效期为 7 天。到期后重新连接 iPhone，并在 Xcode 中再次运行即可续签安装。蓝牙功能必须使用真机测试，iOS 模拟器不能代替车辆 BLE 通信。
+免费 Apple 账户签名通常有效 7 天，到期后需要重新签名安装。
 
 ## 安装 macOS 版本
 
-从 [Releases](https://github.com/CBDT-JWT/yd-ebike-helper/releases/latest) 下载 `yd-ebike-helper-macOS.zip`。
-
-1. 解压下载的 ZIP 文件。
-2. 将 `YD E-Bike Helper.app` 拖入“应用程序”文件夹。
-3. 首次启动时允许应用使用蓝牙。
-4. 如果 macOS 阻止打开，请前往“系统设置 → 隐私与安全性”，在安全性提示中选择“仍要打开”。
-
-## 使用方法
-
-1. 打开应用并点击“刷新扫描”。
-2. 从设备列表中选择目标雅迪电动车。
-3. 核对自动识别的 MAC 地址；无法自动识别时可手动填写。
-4. 点击连接，等待设备认证和 GATT 服务发现完成。
-5. 管理动力锁定、设置提示音音量，或在高级区域发送自定义 HEX 数据。
-6. 通过通信日志查看连接、认证、写入和通知结果。
-
-设备 MAC 地址通常会从广播数据中自动识别。不同车型、控制器版本或固件的广播格式可能不同，因此部分设备仍需手动输入。
-
-## 从源码构建
-
-项目使用 SwiftUI、CoreBluetooth 和 Swift Package Manager。协议测试和 macOS 打包命令：
+可使用仓库发布的 macOS 安装包，或从源码构建：
 
 ```bash
 swift test
 zsh scripts/build-app.sh
 ```
 
-打包完成后会生成：
+打包脚本输出 `dist/yd-ebike-helper-macOS.zip`。解压后将 App 移到“应用程序”，首次运行时允许蓝牙权限。
 
-```text
-dist/yd-ebike-helper-macOS.zip
+## 使用
+
+1. 打开 App 并刷新扫描，选择目标车辆。
+2. 核对设备 MAC。iPhone 的 CoreBluetooth 标识是 UUID，不能替代车辆 MAC；广播候选也需要核对。
+3. 如车辆使用 V2 Token，先打开“雅迪账号与车辆”，登录本人账号并选择已绑定车辆。
+4. 保持认证写入方式为“自动（兼容）”，点击“连接并认证”。V2 需要有回应写入。
+5. 认证完成后再执行车辆支持的操作。操作前让车辆完全停稳。
+6. 遇到问题时导出通信日志，并记录界面的 HTTP 或业务错误码。
+
+## 结果提示与日志
+
+- **GATT 写确认**表示蓝牙写请求已被确认，不能单独证明车辆业务操作完成。
+- **V2 认证成功**需要写确认和车端成功结果，再完成命令通知订阅。
+- **车辆状态已确认**表示已收到与本次动力操作请求一致的合法短状态反馈；它不是带命令序号的执行 ACK，也不是独立测速结果。
+- 未收到目标状态反馈时仅提示“指令已发送”，不把未知结果判为失败。
+- `0x2A`、`0x2B` 周期状态不再解释为通用操作成功或失败；每类每 15 秒最多保留一个原始样本，并汇总省略条数。
+- 最近一次失败记录保留在本机，点击“清空”会同时删除该记录。
+
+## 账号与数据
+
+账号请求仅发送到固定的雅迪 HTTPS 服务域名 `gw.yadeaiot.com.cn`，验证码由用户手动请求。会话保存在本机钥匙串，密码和验证码不持久保存。
+
+获取车辆凭证前会核对当前账号、所选绑定车辆、MAC 和账号角色。退出或变更账号会中止 V2 连接。
+
+V2 挑战值、授权材料、握手密文和认证通知原文不写入日志。日志仍可能包含设备名称和蓝牙地址，公开分享前请检查并遮盖识别信息；不要提交密码、验证码或 Token。
+
+## 构建与验证
+
+```bash
+swift test
 ```
 
-iOS 工程可以使用以下命令执行不签名的 ARM64 编译检查：
+iPhone 不签名编译检查：
 
 ```bash
 xcodebuild \
   -project YDEbikeHelper.xcodeproj \
   -scheme YDEbikeHelper-iOS \
+  -configuration Release \
   -sdk iphoneos \
   -destination 'generic/platform=iOS' \
   CODE_SIGNING_ALLOWED=NO \
   build
 ```
 
-## 注意事项
+测试涵盖认证能力识别、加密固定向量、网关编解码、车辆与角色匹配、异步会话失效、状态反馈和日志采样。离线测试通过不代表所有车型或在线服务均已验证。
 
-- 解除动力锁定后，车辆动力状态可能立即发生变化；请确保车辆完全停稳、支架可靠且周围无障碍物。
-- 请勿在车辆行驶过程中连接或发送控制指令。
-- 不同车型和固件版本的兼容性可能存在差异。
-- 本工具不提供绕过车辆安全机制、所有权验证或访问控制的功能。
+## 协议参考
+
+部分账号接口和 V2 握手字段参考 [YuRong 的协议分析](https://github.com/ghhccghk/YuRong/tree/0df37d80fa747c1c55de278bfa487e5db71e7af6)，使用原生 Swift 和系统 CommonCrypto 独立实现。这些是社区分析资料，并非厂商公布的完整规格；接口或服务策略变化可能影响兼容性。
+
+请勿在车辆行驶过程中连接或发送控制指令。本工具不提供绕过车辆所有权验证或访问控制的功能。
