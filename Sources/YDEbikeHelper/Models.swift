@@ -1,5 +1,25 @@
 import Foundation
 
+enum AppBuildInfo {
+    static var version: String { infoString(for: "CFBundleShortVersionString") ?? "开发版" }
+    static var build: String { infoString(for: "CFBundleVersion") ?? "本地" }
+    static var revision: String { infoString(for: "YDSourceRevision") ?? "local" }
+    static var versionDescription: String { "版本 \(version) · 构建 \(build)" }
+
+    static var shortRevision: String? {
+        let value = revision
+        guard value.count >= 7, value.allSatisfy({ $0.isHexDigit }) else { return nil }
+        return String(value.prefix(8))
+    }
+
+    private static func infoString(for key: String) -> String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("$(") else { return nil }
+        return trimmed
+    }
+}
+
 struct OperationNotice: Equatable {
     let title: String
     let message: String

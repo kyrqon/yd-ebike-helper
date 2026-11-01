@@ -95,6 +95,17 @@ private struct DeviceDiscoveryView: View {
 
     private var bluetoothStatusCard: some View {
         VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(AppBuildInfo.versionDescription)
+                    .font(.subheadline.monospacedDigit())
+                if let revision = AppBuildInfo.shortRevision {
+                    Text("源码 \(revision)")
+                        .font(.caption.monospaced())
+                }
+            }
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+
             HStack(spacing: 14) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
