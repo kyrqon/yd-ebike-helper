@@ -63,9 +63,9 @@ final class BLEManager: NSObject, ObservableObject {
 
     private var currentDiagnosticReport: String {
         let formatter = ISO8601DateFormatter()
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "development"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "local"
-        let revision = Bundle.main.infoDictionary?["YDSourceRevision"] as? String ?? "local"
+        let version = AppBuildInfo.version
+        let build = AppBuildInfo.build
+        let revision = AppBuildInfo.revision
         let entries = logs.map { entry in
             let payload = entry.data.map { "\n  HEX: \($0.spacedHex)" } ?? ""
             return "\(formatter.string(from: entry.timestamp)) [\(entry.direction.rawValue)] \(entry.message)\(payload)"

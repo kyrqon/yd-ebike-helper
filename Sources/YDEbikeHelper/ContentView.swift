@@ -123,6 +123,17 @@ struct ContentView: View {
                         .opacity(bluetooth.isScanning ? 1 : 0)
                 }
 
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(AppBuildInfo.versionDescription)
+                        .font(.caption.monospacedDigit())
+                    if let revision = AppBuildInfo.shortRevision {
+                        Text("源码 \(revision)")
+                            .font(.caption2.monospaced())
+                    }
+                }
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+
                 HStack(spacing: 8) {
                     statusDot
                     Text(bluetooth.isScanning ? "正在扫描" : bluetooth.bluetoothState)
